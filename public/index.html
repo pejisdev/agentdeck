@@ -30,8 +30,16 @@
     </header>
     <input id="projFilter" class="filter" placeholder="Filtrer les projets…" spellcheck="false">
     <ul id="projList"></ul>
+    <section id="usage" title="Comptes Claude et limites de leur plan (comme /usage dans Claude Code)">
+      <div class="usage-head"><span>Comptes Claude</span>
+        <label id="switchBox" class="switch-box" title="Si le compte prévu dépasse ce seuil sur une de ses limites, les nouveaux agents prennent le compte suivant" hidden>
+          <input type="checkbox" id="switchOn"> auto ≥ <input type="number" id="switchThr" min="10" max="100" step="5"> %
+        </label>
+        <button id="addAccount" class="ghost small" title="Connecter un autre compte Claude">+ Compte</button></div>
+      <div id="accountList"></div>
+    </section>
     <footer>
-      <button id="addProj" class="ghost">+ Ajouter un dossier</button>
+      <button id="addProj" class="ghost">+ Ajouter un projet</button>
       <button id="refreshProj" class="ghost icon" title="Rescanner">↻</button>
     </footer>
   </aside>
@@ -40,14 +48,25 @@
     <header class="bar">
       <span id="projTitle" class="title">—</span>
       <span id="projPath" class="muted mono"></span>
+      <select id="projAccount" class="acc-select" title="Compte Claude utilisé par les nouveaux agents de ce projet" hidden></select>
       <span class="spacer"></span>
       <div class="seg" id="layoutSeg">
         <button data-layout="grid" title="Grille 2×2">▦</button>
         <button data-layout="cols" title="4 colonnes">▥</button>
         <button data-layout="rows" title="4 lignes">☰</button>
       </div>
+      <button id="micBtn" class="ghost icon" title="Contrôle vocal (Ctrl+Shift+Espace) : parle, un dispatcher envoie la consigne au bon agent">🎙</button>
       <button id="toggleFiles" class="ghost icon" title="Afficher/masquer les fichiers (Ctrl+B)">◧</button>
     </header>
+    <div id="voiceBar" hidden>
+      <form id="voiceForm">
+        <span id="voiceState" class="vs"></span>
+        <input id="voiceInput" placeholder="Parle, ou tape une consigne : « dis à cabal de lancer les tests »…" spellcheck="false" autocomplete="off">
+        <button class="ghost small">Envoyer</button>
+        <button type="button" id="voiceClose" class="ghost icon" title="Fermer">×</button>
+      </form>
+      <ul id="voiceFeed"></ul>
+    </div>
     <div id="decks"><div class="empty-state">Choisis un projet à gauche</div></div>
   </main>
 
@@ -67,6 +86,7 @@
       <div id="editorToolbar" hidden>
         <span id="filePathLabel" class="mono muted"></span>
         <span class="spacer"></span>
+        <button id="dlBtn" class="ghost small" title="Télécharger ce fichier">⤓ Télécharger</button>
         <button id="diffBtn" class="ghost small" title="Comparer avec HEAD">Diff</button>
         <button id="saveBtn" class="ghost small" title="Enregistrer (Ctrl+S)">Enregistrer</button>
       </div>
@@ -82,6 +102,48 @@
   <div class="palette-box">
     <input id="paletteInput" placeholder="Rechercher un fichier…" spellcheck="false" autocomplete="off">
     <ul id="paletteList"></ul>
+  </div>
+</div>
+
+<div id="repoModal" hidden>
+  <div class="repo-box">
+    <header class="bar">
+      <span class="title">Ajouter un projet</span>
+      <span id="repoRoot" class="muted mono"></span>
+      <span class="spacer"></span>
+      <button id="repoClose" class="ghost icon" title="Fermer">×</button>
+    </header>
+    <div id="repoGh">
+      <div id="repoGhHead" class="repo-row">
+        <span id="repoGhStatus" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="repoGhLogin" class="ghost small" hidden>Connecter GitHub</button>
+        <button id="repoGhRefresh" class="ghost icon" title="Recharger la liste" hidden>↻</button>
+      </div>
+      <input id="repoFilter" class="filter" placeholder="Filtrer mes dépôts GitHub…" spellcheck="false" hidden>
+      <ul id="repoList"></ul>
+    </div>
+    <form id="repoUrlForm" class="repo-row">
+      <input id="repoUrl" class="filter" placeholder="URL git (https://… ou git@…) ou owner/nom" spellcheck="false" autocomplete="off">
+      <button class="ghost small">Cloner</button>
+    </form>
+    <form id="repoPathForm" class="repo-row">
+      <input id="repoPath" class="filter" placeholder="Dossier déjà présent sur le serveur (ex : ~/mon-projet)" spellcheck="false" autocomplete="off">
+      <button class="ghost small">Ajouter</button>
+    </form>
+  </div>
+</div>
+
+<div id="loginModal" hidden>
+  <div class="login-box">
+    <header class="bar">
+      <span class="title">Connexion Claude</span>
+      <span id="loginAccountName" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="loginClose" class="ghost icon" title="Fermer">×</button>
+    </header>
+    <p class="muted">Ouvre le lien affiché dans ton navigateur, connecte-toi avec le compte voulu, puis colle le code ici.</p>
+    <div id="loginTerm"></div>
   </div>
 </div>
 
