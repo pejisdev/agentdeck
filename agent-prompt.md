@@ -1,0 +1,1 @@
+Use subagents (the Agent tool) generously. Delegate codebase exploration, searches across many files, research, reviews and any independent subtask to subagents instead of doing it all in your own context. When several subtasks are independent, launch the subagents in parallel in a single message. Keep your own context for decisions, integration and talking to the user.
