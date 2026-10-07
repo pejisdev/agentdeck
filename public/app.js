@@ -50,7 +50,10 @@ const S = {
   showOld: store.get('showOld', false),
   showParked: store.get('showParked', false),
   files: new Map(),         // id -> FileState
+  accounts: [],             // comptes Claude (de /api/accounts)
 };
+const accountLabel = (key) => { const a = (S.accounts.length ? S.accounts : (S.cfg && S.cfg.accounts) || []).find((x) => x.key === key); return a ? a.label : key; };
+const multiAccount = () => ((S.cfg && S.cfg.accounts) || []).length > 1;
 const BUSY_MS = 3500;
 
 // ---------------------------------------------------------------- login
@@ -62,11 +65,15 @@ $('#loginForm').addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------------- sidebar
+// off | busy | perm (autorisation ou question en attente) | attn (tour fini, à toi) | idle
 function slotState(id, slot) {
   const s = S.status[id] && S.status[id][slot];
   if (!s) return 'off';
-  return S.now - s.activity < BUSY_MS ? 'busy' : 'idle';
+  if (S.now - s.activity < BUSY_MS) return 'busy';
+  if (s.attention) return s.attention.kind === 'permission' ? 'perm' : 'attn';
+  return 'idle';
 }
+const needsYou = (st) => st === 'perm' || st === 'attn';
 
 function ago(ts) {
   if (!ts) return '';
@@ -96,7 +103,7 @@ function renderProjects() {
       title: p.path,
       onclick: () => selectProject(p.id),
     }, dots,
-      h('div', { class: 'pname' }, h('b', {}, p.name), h('small', {}, p.path.replace(/^\/home\/[^/]+/, '~'))),
+      h('div', { class: 'pname' }, h('b', {}, p.name, p.account && p.account !== 'default' ? h('span', { class: 'acct-tag', title: 'Compte Claude : ' + accountLabel(p.account) }, accountLabel(p.account)) : null), h('small', {}, p.path.replace(/^\/home\/[^/]+/, '~'))),
       h('span', { class: 'age', title: p.lastActivity ? new Date(p.lastActivity).toLocaleString('fr-FR') : '' }, ago(p.lastActivity)),
       h('button', { class: 'x', title: p.parked ? 'Sortir du repos' : 'Envoyer au repos (en bas)', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '⤓'),
       h('button', { class: 'x', title: 'Masquer ce projet', onclick: (e) => { e.stopPropagation(); hideProject(p); } }, '×'));
@@ -114,8 +121,9 @@ function renderProjects() {
       `${showParked ? '▾' : '▸'} Au repos · ${parked.length}`));
     if (showParked) parked.forEach((p) => list.append(row(p)));
   }
-  const doneCount = S.done.size;
-  document.title = (doneCount ? `(${doneCount}) ` : '') + 'Agent Deck';
+  let waiting = 0;
+  for (const p of S.projects) for (let i = 0; i < S.cfg.slots; i++) if (needsYou(slotState(p.id, i))) waiting++;
+  document.title = (waiting ? `(${waiting}) ` : '') + 'Agent Deck';
 }
 
 async function loadProjects(refresh) {
@@ -137,11 +145,58 @@ async function hideProject(p) {
 
 $('#projFilter').addEventListener('input', renderProjects);
 $('#refreshProj').addEventListener('click', () => loadProjects(true).then(() => toast('Projets rescannés')));
-$('#addProj').addEventListener('click', async () => {
-  const path = prompt('Chemin du dossier sur le VPS (ex : ~/mon-projet)');
-  if (!path) return;
-  try { const p = await api('/api/projects', { method: 'POST', body: { path } }); await loadProjects(true); selectProject(p.id); }
-  catch (e) { toast(e.message, true); }
+// ---------------------------------------------------------------- ajouter un projet : GitHub, URL git, dossier existant
+let repos = [], repoStatus = null;
+function openRepoModal() { $('#repoModal').hidden = false; $('#repoFilter').value = ''; refreshRepoStatus(); }
+function closeRepoModal() { $('#repoModal').hidden = true; }
+async function refreshRepoStatus() {
+  try { repoStatus = await api('/api/repos/status'); } catch (e) { return toast(e.message, true); }
+  $('#repoRoot').textContent = 'clone dans ' + repoStatus.cloneRoot.replace(/^\/home\/[^/]+/, '~');
+  const st = $('#repoGhStatus');
+  if (!repoStatus.installed) st.textContent = 'GitHub : gh n\'est pas installé sur le serveur';
+  else if (!repoStatus.loggedIn) st.textContent = repoStatus.loginOpen ? 'GitHub : connexion en cours…' : 'GitHub : non connecté';
+  else st.textContent = `GitHub : ${repoStatus.user}`;
+  $('#repoGhLogin').hidden = !repoStatus.installed || repoStatus.loggedIn;
+  $('#repoGhRefresh').hidden = $('#repoFilter').hidden = !repoStatus.loggedIn;
+  if (repoStatus.loggedIn) loadRepos(); else { repos = []; renderRepos(); }
+}
+async function loadRepos(refresh) {
+  const ul = $('#repoList'); ul.textContent = ''; ul.append(h('li', { class: 'empty' }, 'Chargement des dépôts…'));
+  try { repos = await api('/api/repos' + (refresh ? '?refresh=1' : '')); } catch (e) { repos = []; ul.textContent = ''; ul.append(h('li', { class: 'empty' }, e.message)); return; }
+  renderRepos();
+}
+function renderRepos() {
+  const ul = $('#repoList'); ul.textContent = '';
+  const f = $('#repoFilter').value.trim().toLowerCase();
+  const items = repos.filter((r) => !f || r.name.toLowerCase().includes(f) || r.description.toLowerCase().includes(f));
+  if (!items.length && repoStatus && repoStatus.loggedIn) ul.append(h('li', { class: 'empty' }, repos.length ? 'Aucun dépôt ne correspond' : 'Aucun dépôt'));
+  for (const r of items.slice(0, 200)) {
+    ul.append(h('li', { class: r.cloned ? 'cloned' : '', title: r.cloned ? 'Déjà présent sur le serveur' : 'Cloner ' + r.url, onclick: (e) => { if (!r.cloned) cloneRepo(r.name, e.currentTarget); } },
+      h('span', { class: 'rn' }, r.name), r.private ? h('span', { class: 'lock' }, '🔒') : null, h('span', { class: 'rd' }, r.description),
+      h('span', { class: 'rt' }, r.cloned ? 'déjà là' : ago(r.updatedAt))));
+  }
+}
+async function cloneRepo(src, li) {
+  if (li) { li.classList.add('busy'); li.querySelector('.rt').textContent = 'clonage…'; }
+  toast(`Clonage de ${src}…`);
+  try {
+    const p = await api('/api/repos/clone', { method: 'POST', body: { repo: src } });
+    toast(`${p.name} cloné`); closeRepoModal();
+    await loadProjects(true); selectProject(p.id);
+  } catch (e) { toast(e.message, true); if (li) { li.classList.remove('busy'); li.querySelector('.rt').textContent = ago(0); } }
+}
+$('#addProj').addEventListener('click', openRepoModal);
+$('#repoClose').addEventListener('click', closeRepoModal);
+$('#repoModal').addEventListener('mousedown', (e) => { if (e.target.id === 'repoModal') closeRepoModal(); });
+$('#repoFilter').addEventListener('input', renderRepos);
+$('#repoGhRefresh').addEventListener('click', () => loadRepos(true));
+$('#repoGhLogin').addEventListener('click', () => openLogin({ key: 'gh', label: 'github.com' }));
+$('#repoUrlForm').addEventListener('submit', (e) => { e.preventDefault(); const v = $('#repoUrl').value.trim(); if (v) { cloneRepo(v); $('#repoUrl').value = ''; } });
+$('#repoPathForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const path = $('#repoPath').value.trim(); if (!path) return;
+  try { const p = await api('/api/projects', { method: 'POST', body: { path } }); closeRepoModal(); $('#repoPath').value = ''; await loadProjects(true); selectProject(p.id); }
+  catch (err) { toast(err.message, true); }
 });
 
 // ---------------------------------------------------------------- terminaux
@@ -158,12 +213,13 @@ class Pane {
     this.deck = deck; this.slot = slot; this.term = null; this.ws = null; this.retry = 0; this.state = 'off';
     this.stateEl = h('span', { class: 'state' }, 'Libre');
     this.cmdEl = h('span', { class: 'cmd' });
+    this.acctEl = h('span', { class: 'acct-tag', hidden: '' });
     this.killBtn = h('button', { class: 'kill', title: 'Arrêter la session', onclick: () => this.stop() }, '■');
     this.maxBtn = h('button', { title: 'Agrandir (double-clic sur l\'en-tête)', onclick: () => this.toggleMax() }, '⤢');
     this.body = h('div', { class: 'pane-body' });
     this.el = h('div', { class: 'pane' },
       h('div', { class: 'pane-head', ondblclick: () => this.toggleMax() },
-        h('span', { class: 'num' }, String(slot + 1)), this.stateEl, this.cmdEl, h('span', { class: 'spacer' }), this.killBtn, this.maxBtn),
+        h('span', { class: 'num' }, String(slot + 1)), this.stateEl, this.cmdEl, this.acctEl, h('span', { class: 'spacer' }), this.killBtn, this.maxBtn),
       this.body);
     this.el.addEventListener('mousedown', () => this.setFocus(), true);
     new ResizeObserver(() => this.scheduleFit()).observe(this.body);
@@ -182,13 +238,23 @@ class Pane {
     this.resumable = !!(S.resumable[this.deck.id] && S.resumable[this.deck.id][this.slot]);
     const cmds = this.resumable ? [...S.cfg.commands].sort((a, b) => (b.key === 'continue') - (a.key === 'continue')) : S.cfg.commands;
     const btns = cmds.map((c) => h('button', { onclick: () => this.start(c.key) }, this.resumable && c.key === 'continue' ? 'Reprendre la conversation' : c.label));
-    this.body.append(h('div', { class: 'placeholder' }, h('div', {}, `Agent ${this.slot + 1} — libre`), h('div', { class: 'btns' }, btns)));
+    this.accPick = null;
+    let pick = null;
+    if (multiAccount()) {
+      const proj = S.projects.find((x) => x.id === this.deck.id);
+      this.accPick = h('select', { class: 'acc-select' }, S.cfg.accounts.map((a) => h('option', { value: a.key }, a.label)));
+      this.accPick.value = (proj && proj.account) || 'default';
+      pick = h('label', { class: 'acc-pick' }, 'Compte', this.accPick);
+    }
+    this.body.append(h('div', { class: 'placeholder' }, h('div', {}, `Agent ${this.slot + 1} — libre`), h('div', { class: 'btns' }, btns), pick));
   }
 
   async start(cmd) {
     try {
       const r = this.body.getBoundingClientRect();
-      await api(`${P(this.deck.id)}/slots/${this.slot}/start`, { method: 'POST', body: { cmd, cols: Math.floor((r.width - 6) / 7.8), rows: Math.floor((r.height - 4) / 17) } });
+      const account = this.accPick ? this.accPick.value : undefined;
+      const res = await api(`${P(this.deck.id)}/slots/${this.slot}/start`, { method: 'POST', body: { cmd, account, cols: Math.floor((r.width - 6) / 7.8), rows: Math.floor((r.height - 4) / 17) } });
+      if (res.switched) toast(`Compte prévu saturé : agent lancé sur « ${accountLabel(res.account)} »`);
       this.connect();
       pollStatus();
     } catch (e) { toast(e.message, true); }
@@ -241,6 +307,7 @@ class Pane {
     term.attachCustomKeyEventHandler((e) => {
       // Laisse passer nos raccourcis globaux
       if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && ['p', 'b'].includes(e.key.toLowerCase()) && !e.shiftKey) return false;
+      if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.code === 'Space') return false;
       if (e.type === 'keydown' && e.altKey && /^[1-4]$/.test(e.key)) return false;
       // Shift+Entrée : nouvelle ligne dans Claude Code. xterm.js enverrait un simple CR (indistinguable d'Entrée),
       // on envoie ESC+CR (Meta+Entrée), ce que /terminal-setup configure aussi dans iTerm2/VS Code.
@@ -301,11 +368,14 @@ class Pane {
   update() {
     const running = this.isRunning();
     const st = running ? slotState(this.deck.id, this.slot) : 'off';
-    this.el.classList.remove('st-off', 'st-idle', 'st-busy');
+    this.el.classList.remove('st-off', 'st-idle', 'st-busy', 'st-attn', 'st-perm');
     this.el.classList.add('st-' + st);
-    this.stateEl.textContent = st === 'busy' ? 'Travaille…' : st === 'idle' ? 'En attente' : 'Libre';
+    this.stateEl.textContent = { busy: 'Travaille…', idle: 'En attente', attn: 'A terminé — à toi', perm: 'Attend ton autorisation', off: 'Libre' }[st];
     const s = running && S.status[this.deck.id][this.slot];
     this.cmdEl.textContent = s && s.command && s.command !== 'bash' ? s.command : running ? 'shell' : '';
+    const acct = s && s.account;
+    this.acctEl.hidden = !(acct && (multiAccount() || acct !== 'default'));
+    if (!this.acctEl.hidden) { this.acctEl.textContent = accountLabel(acct); this.acctEl.title = 'Compte Claude : ' + accountLabel(acct); }
     if (running && !this.ws) this.connect();
     if (!running && this.term && !this.ws) this.teardown();
     else if (!running && !this.term && this.resumable !== !!(S.resumable[this.deck.id] && S.resumable[this.deck.id][this.slot])) this.showPlaceholder();
@@ -335,12 +405,13 @@ async function pollStatus() {
   try {
     const r = await api('/api/status');
     S.now = r.now; S.status = r.sessions; S.resumable = r.resumable || {};
-    // Détecte les agents qui viennent de finir (busy -> idle) hors du projet affiché
+    // Agents qui passent en « à toi » (hook Stop / permission) hors du projet affiché : point bleu + notification
     for (const p of S.projects) {
       for (let i = 0; i < S.cfg.slots; i++) {
-        const k = p.id + ':' + i, busy = slotState(p.id, i) === 'busy';
-        if (S.prevBusy[k] && !busy && (p.id !== S.current || document.hidden)) notifyDone(p, i);
-        S.prevBusy[k] = busy;
+        const k = p.id + ':' + i, st = slotState(p.id, i), s = S.status[p.id] && S.status[p.id][i];
+        const stamp = needsYou(st) && s.attention ? s.attention.kind + s.attention.at : null;
+        if (stamp && S.prevBusy[k] !== stamp && (p.id !== S.current || document.hidden || (s.attention && s.attention.voice))) notifyDone(p, i, st);
+        S.prevBusy[k] = stamp;
       }
     }
     renderProjects();
@@ -349,11 +420,13 @@ async function pollStatus() {
   } catch {}
 }
 
-function notifyDone(p, slot) {
-  if (!(S.status[p.id] && S.status[p.id][slot])) return;
+function notifyDone(p, slot, st) {
+  const s = S.status[p.id] && S.status[p.id][slot];
+  if (!s) return;
+  if (s.attention && s.attention.voice) voiceAgentDone(p, slot, st, s.attention.message);
   if (p.id !== S.current) { S.done.add(p.id); store.set('done', [...S.done]); }
   if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-    new Notification(`${p.name} · agent ${slot + 1}`, { body: 'A terminé, en attente de toi', tag: p.id + slot });
+    new Notification(`${p.name} · agent ${slot + 1}`, { body: st === 'perm' ? 'Demande ton autorisation' : 'A terminé, en attente de toi', tag: p.id + slot });
   }
 }
 
@@ -367,6 +440,255 @@ async function autoResume(id) {
   } catch (e) { toast(e.message, true); }
 }
 
+// ---------------------------------------------------------------- usage Claude (limites du plan)
+function untilReset(ts) {
+  if (!ts) return '';
+  const m = Math.max(0, Math.round((ts - S.now) / 60000));
+  if (m < 60) return `${m} min`;
+  if (m < 36 * 60) return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`;
+  const d = new Date(ts);
+  return d.toLocaleDateString('fr-FR', { weekday: 'short' }) + ' ' + d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+}
+
+const planName = (a) => a.plan ? a.plan.replace(/^claude_/, '').toUpperCase() + (a.tier && /(\d+)x/.test(a.tier) ? ' ' + a.tier.match(/(\d+)x/)[1] + '×' : '') : '';
+
+function usageBars(u) {
+  const bars = h('div', { class: 'ubars' });
+  const rank = (l) => ({ session: 0, weekly_all: 1 })[l.kind] ?? 2;
+  const limits = [...(u.limits || [])].sort((a, b) => rank(a) - rank(b));
+  for (const l of limits) {
+    const cls = l.percent >= 100 ? 'full' : l.percent >= 80 ? 'hot' : l.percent >= 50 ? 'warn' : '';
+    bars.append(h('div', { class: 'ubar ' + cls, title: l.resetsAt ? `Réinitialisation ${new Date(l.resetsAt).toLocaleString('fr-FR')}` : '' },
+      h('span', { class: 'ul' }, l.label),
+      h('span', { class: 'ur' }, l.resetsAt ? '↻ ' + untilReset(l.resetsAt) : ''),
+      h('span', { class: 'up' }, `${Math.round(l.percent)} %`),
+      h('div', { class: 'ut' }, h('div', { class: 'uf', style: `width:${Math.min(100, l.percent)}%` }))));
+  }
+  if (u.extra) {
+    bars.append(h('div', { class: 'ubar ' + (u.extra.percent >= 80 ? 'hot' : ''), title: 'Crédits supplémentaires (extra usage)' },
+      h('span', { class: 'ul' }, 'Crédits extra'), h('span', { class: 'ur' }, u.extra.limit != null ? `${u.extra.used ?? 0} / ${u.extra.limit} ${u.extra.currency || ''}` : ''),
+      h('span', { class: 'up' }, `${Math.round(u.extra.percent)} %`),
+      h('div', { class: 'ut' }, h('div', { class: 'uf', style: `width:${Math.min(100, u.extra.percent)}%` }))));
+  }
+  return bars;
+}
+
+// Un bloc par compte : connecté ou non, plan, usage, nombre de projets/agents qui s'en servent
+function renderAccounts() {
+  const list = $('#accountList');
+  list.textContent = '';
+  for (const a of S.accounts) {
+    const u = a.usage || {};
+    const el = h('div', { class: 'acct ' + (a.loggedIn ? 'on' : 'off') },
+      h('div', { class: 'acct-head' },
+        h('i', { class: 'acc-dot', title: a.loggedIn ? 'Connecté' : 'Non connecté' }),
+        h('b', { title: a.label }, a.label),
+        h('span', { class: 'plan' }, planName(a)),
+        h('span', { class: 'spacer' }),
+        h('span', { class: 'cnt', title: `${a.projects} projet(s) · ${a.agents} agent(s) en cours` }, `${a.projects}p · ${a.agents}a`),
+        a.loggedIn ? h('button', { class: 'x', title: 'Reconnecter (changer de compte)', onclick: () => openLogin(a) }, '↻') : null,
+        a.isDefault ? null : h('button', { class: 'x', title: 'Retirer ce compte', onclick: () => removeAccount(a) }, '×')),
+      a.email ? h('small', { class: 'email', title: a.org || '' }, a.email) : null);
+    if (!a.loggedIn) el.append(h('button', { class: 'connect', onclick: () => openLogin(a) }, a.loginOpen ? 'Connexion en cours…' : 'Se connecter'));
+    else {
+      el.append(usageBars(u));
+      if (u.error) el.append(h('div', { class: 'note' }, '⚠ ' + u.error + (u.stale ? ' (dernière valeur connue)' : '')));
+    }
+    list.append(el);
+  }
+  // Sélecteur de compte du projet courant
+  const sel = $('#projAccount');
+  sel.hidden = !multiAccount() || !S.current;
+  if (!sel.hidden) {
+    const p = S.projects.find((x) => x.id === S.current);
+    sel.textContent = '';
+    S.cfg.accounts.forEach((a) => sel.append(h('option', { value: a.key }, a.label)));
+    sel.value = (p && p.account) || 'default';
+  }
+}
+
+function renderSwitch() {
+  const box = $('#switchBox');
+  box.hidden = !multiAccount();
+  const sw = (S.cfg && S.cfg.accountSwitch) || { enabled: false, threshold: 80 };
+  $('#switchOn').checked = !!sw.enabled;
+  if (document.activeElement !== $('#switchThr')) $('#switchThr').value = sw.threshold;
+}
+async function saveSwitch() {
+  try {
+    S.cfg.accountSwitch = await api('/api/account-switch', { method: 'POST', body: { enabled: $('#switchOn').checked, threshold: Number($('#switchThr').value) } });
+    renderSwitch();
+    toast(S.cfg.accountSwitch.enabled ? `Bascule auto au-delà de ${S.cfg.accountSwitch.threshold} %` : 'Bascule auto désactivée');
+  } catch (e) { toast(e.message, true); }
+}
+$('#switchOn').addEventListener('change', saveSwitch);
+$('#switchThr').addEventListener('change', saveSwitch);
+
+let usageTimer;
+async function pollUsage() {
+  clearTimeout(usageTimer);
+  usageTimer = setTimeout(pollUsage, 60000);
+  let r;
+  try { r = await api('/api/accounts'); } catch { return; }
+  S.now = r.now; S.accounts = r.accounts;
+  if (S.cfg) S.cfg.accounts = r.accounts.map(({ key, label }) => ({ key, label }));
+  renderAccounts(); renderSwitch();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollUsage(); });
+
+$('#projAccount').addEventListener('change', async (e) => {
+  if (!S.current) return;
+  try {
+    await api(`${P(S.current)}/account`, { method: 'POST', body: { account: e.target.value } });
+    const p = S.projects.find((x) => x.id === S.current); if (p) p.account = e.target.value;
+    toast(`Nouveaux agents de ce projet : compte « ${accountLabel(e.target.value)} »`);
+    renderProjects(); pollUsage();
+    const d = S.decks.get(S.current); if (d) d.panes.forEach((pn) => { if (!pn.term) pn.showPlaceholder(); });
+  } catch (err) { toast(err.message, true); }
+});
+
+$('#addAccount').addEventListener('click', async () => {
+  const label = prompt('Nom du compte (ex : Perso, Boulot, Max 2)');
+  if (!label) return;
+  try { const a = await api('/api/accounts', { method: 'POST', body: { label } }); await pollUsage(); openLogin(a); }
+  catch (e) { toast(e.message, true); }
+});
+
+async function removeAccount(a) {
+  if (!confirm(`Retirer le compte « ${a.label} » ?\nSes identifiants seront supprimés du VPS ; les projets qui l'utilisaient repassent sur le compte principal.`)) return;
+  try { await api(`/api/accounts/${a.key}`, { method: 'DELETE' }); await loadProjects(); await pollUsage(); }
+  catch (e) { toast(e.message, true); }
+}
+
+// Fenêtre de connexion : terminal attaché à la session tmux qui lance `claude auth login` pour ce compte
+let loginTerm = null, loginWs = null;
+function closeLogin() {
+  $('#loginModal').hidden = true;
+  if (loginWs) { const w = loginWs; loginWs = null; w.close(); }
+  if (loginTerm) { loginTerm.dispose(); loginTerm = null; }
+  pollUsage();
+  if (!$('#repoModal').hidden) refreshRepoStatus();
+}
+async function openLogin(a) {
+  const gh = a.key === 'gh';
+  $('#loginAccountName').textContent = a.label;
+  $('#loginModal .title').textContent = gh ? 'Connexion GitHub' : 'Connexion Claude';
+  $('#loginModal p').textContent = gh ? 'Note le code affiché, ouvre le lien github.com/login/device dans ton navigateur et saisis-le. Appuie sur Entrée ici quand c\'est demandé.'
+    : 'Ouvre le lien affiché dans ton navigateur, connecte-toi avec le compte voulu, puis colle le code ici.';
+  $('#loginModal').hidden = false;
+  const holder = $('#loginTerm'); holder.textContent = '';
+  const term = new Terminal({ fontFamily: "'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace", fontSize: 13, lineHeight: 1.15, theme: TERM_THEME, cursorBlink: true, scrollback: 500 });
+  const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  try { term.loadAddon(new ClipboardAddon.ClipboardAddon()); } catch {}
+  term.open(holder); fit.fit(); loginTerm = term;
+  try { await api(gh ? '/api/repos/login' : `/api/accounts/${a.key}/login`, { method: 'POST', body: { cols: term.cols, rows: term.rows } }); }
+  catch (e) { toast(e.message, true); return closeLogin(); }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/term?${q({ login: a.key, cols: term.cols, rows: term.rows })}`);
+  loginWs = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ t: 'r', c: term.cols, r: term.rows }));
+  ws.onmessage = (e) => term.write(e.data);
+  ws.onclose = () => { if (loginWs === ws) { loginWs = null; setTimeout(closeLogin, 600); } };
+  term.onData((d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d })); });
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type === 'keydown' && e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'v') return false; // collage natif du code OAuth
+    return true;
+  });
+  term.focus();
+}
+$('#loginClose').addEventListener('click', closeLogin);
+$('#loginModal').addEventListener('mousedown', (e) => { if (e.target.id === 'loginModal') closeLogin(); });
+
+// ---------------------------------------------------------------- contrôle vocal
+// Une seule entrée (micro ou texte) → /api/voice/dispatch → un Claude headless envoie la consigne au bon agent
+// et répond en une phrase, lue à voix haute. Quand cet agent finit, son dernier message est lu aussi.
+const Voice = {
+  rec: null, listening: false, busy: false, spoken: new Set(),
+  get lang() { return (S.cfg && S.cfg.voice && S.cfg.voice.lang) || 'fr-FR'; },
+  get canSpeak() { return 'speechSynthesis' in window && !(S.cfg && S.cfg.voice && S.cfg.voice.speak === false); },
+};
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+function voiceOpen() { $('#voiceBar').hidden = false; $('#voiceInput').focus(); S.decks.forEach((d) => d.panes.forEach((p) => p.scheduleFit())); }
+function voiceClose() { voiceStop(); $('#voiceBar').hidden = true; S.decks.forEach((d) => d.panes.forEach((p) => p.scheduleFit())); }
+function voiceSetState(st) {
+  $('#voiceState').className = 'vs ' + (st || '');
+  $('#micBtn').className = 'ghost icon ' + (st === 'listening' || st === 'thinking' ? st : '');
+}
+function voiceLog(who, text, cls, link) {
+  const ul = $('#voiceFeed');
+  const txt = h('span', { class: 'txt' }, text);
+  if (link) txt.append(' ', h('a', { onclick: () => { selectProject(link.id); const d = S.decks.get(link.id); const pn = d && d.panes[link.slot]; if (pn) { pn.setFocus(); pn.term && pn.term.focus(); } } }, '→ voir'));
+  ul.append(h('li', { class: cls }, h('span', { class: 'who' }, who), txt));
+  while (ul.children.length > 30) ul.firstChild.remove();
+  ul.scrollTop = ul.scrollHeight;
+}
+function speak(text) {
+  if (!Voice.canSpeak || !text) return;
+  const clean = String(text).replace(/[`*_#>]+/g, '').replace(/\[(.*?)\]\(.*?\)/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 400);
+  if (!clean) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(clean);
+  u.lang = Voice.lang;
+  const v = speechSynthesis.getVoices().find((x) => x.lang.replace('_', '-').toLowerCase() === Voice.lang.toLowerCase());
+  if (v) u.voice = v;
+  u.onstart = () => voiceSetState('speaking'); u.onend = () => voiceSetState(Voice.listening ? 'listening' : '');
+  speechSynthesis.speak(u);
+}
+function voiceStart() {
+  if (!SR) { voiceOpen(); toast('Reconnaissance vocale indisponible dans ce navigateur (Chrome ou Edge) : tape ta consigne', true); return; }
+  if (Voice.listening) return voiceStop();
+  voiceOpen();
+  speechSynthesis && speechSynthesis.cancel();
+  const rec = new SR();
+  rec.lang = Voice.lang; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+  let finalText = '';
+  rec.onresult = (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) { const t = e.results[i][0].transcript; if (e.results[i].isFinal) finalText += t; else interim += t; }
+    $('#voiceInput').value = (finalText + ' ' + interim).trim();
+  };
+  rec.onerror = (e) => { if (e.error !== 'aborted' && e.error !== 'no-speech') toast('Micro : ' + e.error, true); };
+  rec.onend = () => {
+    Voice.listening = false; Voice.rec = null; voiceSetState('');
+    const text = $('#voiceInput').value.trim();
+    if (finalText.trim() && text) voiceSend(text);
+  };
+  Voice.rec = rec; Voice.listening = true; voiceSetState('listening');
+  $('#voiceInput').value = '';
+  try { rec.start(); } catch (e) { Voice.listening = false; voiceSetState(''); toast('Micro : ' + e.message, true); }
+}
+function voiceStop() { if (Voice.rec) { try { Voice.rec.abort(); } catch {} } Voice.listening = false; Voice.rec = null; voiceSetState(''); }
+async function voiceSend(text) {
+  if (Voice.busy || !text) return;
+  Voice.busy = true; voiceSetState('thinking');
+  voiceLog('toi', text, 'me');
+  $('#voiceInput').value = '';
+  try {
+    const r = await api('/api/voice/dispatch', { method: 'POST', body: { text, current: S.current } });
+    const where = r.projectName ? `${r.projectName} · agent ${(r.slot ?? 0) + 1}` : null;
+    const link = r.projectId && r.slot != null ? { id: r.projectId, slot: r.slot } : null;
+    voiceLog('deck', (r.action === 'send' ? `→ ${where} : « ${r.instruction} »  ` : r.action === 'start' ? `▶ ${where} démarré : « ${r.instruction} »  ` : '') + r.reply, 'bot', link);
+    speak(r.reply);
+    if (r.action !== 'reply') pollStatus();
+  } catch (e) { voiceLog('deck', '⚠ ' + e.message, 'bot'); toast(e.message, true); }
+  finally { Voice.busy = false; if (!Voice.listening) voiceSetState(''); }
+}
+// Un agent sollicité par la voix a fini : on affiche et on lit son dernier message
+function voiceAgentDone(p, slot, st, message) {
+  const key = p.id + ':' + slot + ':' + (S.status[p.id][slot].attention.at || 0);
+  if (Voice.spoken.has(key)) return;
+  Voice.spoken.add(key);
+  const who = `${p.name} · agent ${slot + 1}`;
+  const text = st === 'perm' ? 'demande ton autorisation' : (message ? message.replace(/\s+/g, ' ').trim() : 'a terminé');
+  voiceOpen();
+  voiceLog(who, text, 'agent', { id: p.id, slot });
+  speak(`${p.name}, agent ${slot + 1} : ${text}`);
+}
+$('#micBtn').addEventListener('click', voiceStart);
+$('#voiceClose').addEventListener('click', voiceClose);
+$('#voiceForm').addEventListener('submit', (e) => { e.preventDefault(); voiceStop(); voiceSend($('#voiceInput').value.trim()); });
+if ('speechSynthesis' in window) speechSynthesis.getVoices();
+
 // ---------------------------------------------------------------- sélection projet
 async function selectProject(id) {
   const p = S.projects.find((x) => x.id === id);
@@ -375,6 +697,7 @@ async function selectProject(id) {
   S.done.delete(id); store.set('done', [...S.done]);
   $('#projTitle').textContent = p.name;
   $('#projPath').textContent = p.path;
+  renderAccounts();
   $('.empty-state') && $('.empty-state').remove();
   if (!S.decks.has(id)) S.decks.set(id, new Deck(id));
   S.decks.forEach((d, k) => d.show(k === id));
@@ -445,7 +768,9 @@ function renderTree() {
         class: cls.join(' '), style: `padding-left:${6 + depth * 12}px`, title: rel,
         onclick: () => (e.dir ? toggleDir(rel) : openFile(rel)),
       }, h('span', { class: 'tw' }, e.dir ? (open ? '▾' : '▸') : ''), h('span', { class: 'ic' }, e.dir ? '' : fileIcon(e.name)),
-        h('span', { class: 'nm' }, e.name), code ? h('span', { class: 'gs' }, code) : null));
+        h('span', { class: 'nm' }, e.name),
+        e.dir ? null : h('button', { class: 'dl', title: 'Télécharger', onclick: (ev) => { ev.stopPropagation(); downloadFile(rel); } }, '⤓'),
+        code ? h('span', { class: 'gs' }, code) : null));
       if (open) walk(rel, depth + 1);
     }
   };
@@ -599,12 +924,19 @@ async function showActive() {
     const raw = `${P(fs.id)}/raw?${q({ path: tab.path })}`;
     if (tab.kind === 'media' && tab.mime.startsWith('image/')) prev.append(h('img', { src: raw + '&t=' + tab.mtime }));
     else if (tab.kind === 'media' && tab.mime === 'application/pdf') prev.append(h('iframe', { src: raw }));
-    else prev.append(h('div', {}, `${tab.kind === 'large' ? 'Fichier trop volumineux' : 'Fichier binaire'} · ${(tab.size / 1024).toFixed(1)} Ko `, h('a', { href: raw, download: tab.path.split('/').pop(), style: 'color:var(--blue)' }, 'Télécharger')));
+    else prev.append(h('div', {}, `${tab.kind === 'large' ? 'Fichier trop volumineux' : 'Fichier binaire'} · ${(tab.size / 1024).toFixed(1)} Ko `, h('a', { href: raw + '&download=1', download: tab.path.split('/').pop(), style: 'color:var(--blue)' }, 'Télécharger')));
   }
+}
+// Téléchargement via un lien éphémère : le serveur force l'attachement et le nom de fichier
+function downloadFile(rel) {
+  const fs = FS(); if (!fs) return;
+  const a = h('a', { href: `${P(fs.id)}/raw?${q({ path: rel, download: 1 })}`, download: rel.split('/').pop() });
+  document.body.append(a); a.click(); a.remove();
 }
 function curPathOf(model) { return model.uri.path.split('/').slice(2).join('/'); }
 
 $('#diffBtn').addEventListener('click', () => { diffMode = !diffMode; showActive(); });
+$('#dlBtn').addEventListener('click', () => { const fs = FS(); if (fs && fs.active) downloadFile(fs.active); });
 $('#saveBtn').addEventListener('click', () => saveActive());
 
 async function saveActive() {
@@ -691,6 +1023,8 @@ document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && !e.shiftKey && e.key.toLowerCase() === 'p') { e.preventDefault(); openPalette(); }
   else if (mod && !e.shiftKey && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleFiles(); }
+  else if (e.ctrlKey && e.shiftKey && e.code === 'Space') { e.preventDefault(); voiceStart(); }
+  else if (e.key === 'Escape' && !$('#voiceBar').hidden && document.activeElement === $('#voiceInput')) { voiceClose(); }
   else if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveActive(); }
   else if (e.altKey && /^[1-4]$/.test(e.key)) {
     e.preventDefault();
@@ -735,9 +1069,11 @@ dragGutter($('#gutterH'), (e) => {
   if (store.get('noFiles', false)) $('#app').classList.add('no-files');
   try { S.cfg = await api('/api/config'); } catch { return; }
   $('#hostName').textContent = S.cfg.host;
+  renderSwitch();
   setLayout(S.layout);
   await loadProjects();
   await pollStatus();
+  pollUsage();
   const last = store.get('current');
   if (last && S.projects.some((p) => p.id === last)) selectProject(last);
   setInterval(pollStatus, 1500);

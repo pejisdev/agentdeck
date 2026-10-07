@@ -37,7 +37,14 @@ const DEFAULT_CONFIG = {
   staleDays: 30, // au-delà, le projet passe dans « Anciens » (replié)
   // À l'ouverture d'un projet sans agent : reprend les conversations des N derniers jours (sinon la dernière)
   autoResume: { enabled: true, days: 3, max: 4 },
+  // Bascule automatique : si le compte prévu dépasse ce % sur une de ses limites, les nouveaux agents prennent le compte suivant
+  accountSwitch: { enabled: false, threshold: 80 },
+  // Contrôle vocal : modèle du dispatcher (claude -p, sur ton abonnement) et langue de reconnaissance/synthèse
+  voice: { model: 'sonnet', lang: 'fr-FR', speak: true },
   parked: [],    // projets envoyés « Au repos », tout en bas
+  // Comptes Claude : « default » = ~/.claude ; les autres ont leur propre dossier (CLAUDE_CONFIG_DIR) sous ~/.claude-accounts
+  accounts: [{ key: 'default', label: 'Principal' }],
+  projectAccounts: {}, // chemin du projet -> clé du compte à utiliser
   commands: [
     { key: 'claude', label: 'Claude', cmd: 'claude --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
     { key: 'continue', label: 'Reprendre', cmd: 'claude --continue --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
@@ -52,6 +59,151 @@ function loadConfig() {
 }
 let config = loadConfig();
 const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+
+// ---------- comptes Claude ----------
+// Chaque compte supplémentaire = un CLAUDE_CONFIG_DIR à lui (identifiants, .claude.json), où l'on partage par lien
+// symbolique ce qui doit rester commun : réglages (hooks), skills, plugins, et les transcripts (projects/) pour
+// que la reprise de conversation marche quel que soit le compte.
+const ACCOUNTS_DIR = path.join(HOME, '.claude-accounts');
+const SHARED_ITEMS = ['settings.json', 'skills', 'plugins', 'commands', 'agents', 'projects', 'plans', 'CLAUDE.md'];
+if (!Array.isArray(config.accounts) || !config.accounts.some((a) => a.key === 'default')) config.accounts = [{ key: 'default', label: 'Principal' }, ...(config.accounts || []).filter((a) => a.key !== 'default')];
+config.projectAccounts ||= {};
+const accountDir = (a) => (a.key === 'default' ? path.join(HOME, '.claude') : path.join(ACCOUNTS_DIR, a.key));
+const getAccount = (key) => config.accounts.find((a) => a.key === key) || config.accounts[0];
+const projectAccount = (projectPath) => getAccount(config.projectAccounts[projectPath] || 'default');
+// Variables d'environnement à injecter dans la session tmux d'un compte
+const accountEnv = (a) => (a.key === 'default' ? [] : ['-e', 'CLAUDE_CONFIG_DIR=' + accountDir(a)]);
+
+async function createAccount(label) {
+  const base = String(label || '').trim();
+  if (!base) throw Object.assign(new Error('nom du compte manquant'), { status: 400 });
+  let key = base.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'compte';
+  if (key === 'default' || config.accounts.some((a) => a.key === key)) key += '-' + crypto.randomBytes(2).toString('hex');
+  const a = { key, label: base };
+  const dir = accountDir(a);
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  for (const item of SHARED_ITEMS) {
+    const src = path.join(HOME, '.claude', item), dst = path.join(dir, item);
+    if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+    await fsp.symlink(src, dst);
+  }
+  // .claude.json sans le compte connecté : garde l'onboarding fait, les projets approuvés et les serveurs MCP
+  try {
+    const j = JSON.parse(await fsp.readFile(path.join(HOME, '.claude.json'), 'utf8'));
+    for (const k of ['oauthAccount', 'userID', 'passesEligibilityCache', 'overageCreditGrantCache', 'modelAccessCache', 'orgModelDefaultCache', 'cachedExtraUsageDisabledReason']) delete j[k];
+    if (!fs.existsSync(path.join(dir, '.claude.json'))) await fsp.writeFile(path.join(dir, '.claude.json'), JSON.stringify(j, null, 2), { mode: 0o600 });
+  } catch {}
+  config.accounts.push(a);
+  saveConfig();
+  return a;
+}
+
+async function removeAccount(key) {
+  const a = config.accounts.find((x) => x.key === key);
+  if (!a || key === 'default') throw Object.assign(new Error('compte introuvable ou non supprimable'), { status: 400 });
+  const live = await listSessions();
+  if (Object.entries(slotsState).some(([n, r]) => r.account === key && live[n])) throw Object.assign(new Error('des agents tournent encore avec ce compte'), { status: 409 });
+  try { await tmux('kill-session', '-t', '=' + loginSession(key)); } catch {}
+  const dir = accountDir(a);
+  if (dir.startsWith(ACCOUNTS_DIR + path.sep)) await fsp.rm(dir, { recursive: true, force: true }); // les liens symboliques sont retirés, pas leurs cibles
+  config.accounts = config.accounts.filter((x) => x.key !== key);
+  for (const [p, k] of Object.entries(config.projectAccounts)) if (k === key) delete config.projectAccounts[p];
+  saveConfig();
+}
+
+// Qui est connecté sur ce compte (lu dans son .claude.json, écrit par Claude Code au login)
+async function accountIdentity(a) {
+  const dir = accountDir(a);
+  const out = { loggedIn: false, email: null, org: null, plan: null, tier: null };
+  try {
+    const j = JSON.parse(await fsp.readFile(a.key === 'default' ? path.join(HOME, '.claude.json') : path.join(dir, '.claude.json'), 'utf8'));
+    if (j.oauthAccount) { out.email = j.oauthAccount.emailAddress || null; out.org = j.oauthAccount.organizationName || null; out.plan = j.oauthAccount.organizationType || null; out.tier = j.oauthAccount.organizationRateLimitTier || null; }
+  } catch {}
+  try {
+    const c = JSON.parse(await fsp.readFile(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth;
+    if (c && c.accessToken) { out.loggedIn = true; out.plan = c.subscriptionType || out.plan; out.tier = c.rateLimitTier || out.tier; }
+  } catch {}
+  return out;
+}
+const loginSession = (key) => `adlogin_${key}`;
+
+// Choix du compte au lancement : celui prévu, sauf s'il est « chaud » et que la bascule auto est active.
+// Chaud = non connecté, ou une de ses limites (session, semaine…) au-dessus du seuil.
+async function pickAccount(preferred) {
+  const sw = config.accountSwitch || {};
+  if (!sw.enabled || config.accounts.length < 2) return { account: preferred, switched: false };
+  const thr = Number(sw.threshold) || 80;
+  const hot = async (a) => {
+    const u = await fetchUsage(a);
+    if (!u.data) return true; // pas de token ou API en échec : on évite ce compte
+    return u.data.limits.some((l) => l.percent >= thr);
+  };
+  if (!(await hot(preferred))) return { account: preferred, switched: false };
+  const order = config.accounts;
+  const i = order.findIndex((a) => a.key === preferred.key);
+  for (let k = 1; k < order.length; k++) {
+    const a = order[(i + k) % order.length];
+    if (!(await hot(a))) return { account: a, switched: true };
+  }
+  return { account: preferred, switched: false }; // tout le monde est chaud : on garde le compte prévu
+}
+
+// ---------- attention (agent qui attend) ----------
+// Les hooks Claude (hooks/agent-event.sh, installés dans ~/.claude/settings.json au démarrage) écrivent
+// data/events/<emplacement> : « permission » (autorisation ou question posée), « done » (tour terminé, à toi),
+// « working » (tu as répondu / un outil tourne). Ça remplace l'heuristique « plus d'activité = a fini ».
+const EVENTS_DIR = path.join(DATA, 'events');
+fs.mkdirSync(EVENTS_DIR, { recursive: true });
+async function readAttention(name) {
+  try {
+    const j = JSON.parse(await fsp.readFile(path.join(EVENTS_DIR, name), 'utf8'));
+    if (!j.kind || j.kind === 'working') return null;
+    const out = { kind: j.kind, at: Number(j.at) || 0 };
+    if (typeof j.message === 'string' && j.message) out.message = j.message.slice(0, 1200);
+    if (voiceTargets.has(name)) out.voice = true;
+    return out;
+  } catch { return null; }
+}
+// Emplacements sollicités par la voix : leur fin de tour est lue à voix haute dans le navigateur
+const voiceTargets = new Map(); // nom de session -> horodatage
+const clearAttention = (name) => fsp.unlink(path.join(EVENTS_DIR, name)).catch(() => {});
+
+const HOOK_SCRIPT = path.join(__dirname, 'hooks/agent-event.sh');
+const WANTED_HOOKS = {
+  SessionStart: [{ hooks: [{ type: 'command', command: path.join(__dirname, 'hooks/session-start.sh') }] }],
+  // async : n'ajoute aucune latence à Claude ; permission_prompt n'est émis qu'après ~6 s d'attente, c'est voulu
+  Notification: [
+    { matcher: 'permission_prompt|elicitation_dialog|agent_needs_input', hooks: [{ type: 'command', command: `${HOOK_SCRIPT} permission`, async: true, timeout: 10 }] },
+    { matcher: 'idle_prompt', hooks: [{ type: 'command', command: `${HOOK_SCRIPT} done`, async: true, timeout: 10 }] },
+  ],
+  Stop: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} done`, async: true, timeout: 10 }] }],
+  UserPromptSubmit: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} working`, async: true, timeout: 10 }] }],
+  PostToolUse: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} working`, async: true, timeout: 10 }] }],
+};
+// Ajoute nos hooks aux réglages Claude de l'utilisateur s'ils manquent (idempotent, ne touche pas aux autres hooks)
+function ensureHooks() {
+  const file = path.join(HOME, '.claude/settings.json');
+  let st = {};
+  try { st = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  st.hooks ||= {};
+  let added = 0;
+  for (const [ev, groups] of Object.entries(WANTED_HOOKS)) {
+    st.hooks[ev] ||= [];
+    for (const g of groups) {
+      const want = g.hooks[0].command;
+      const present = st.hooks[ev].some((x) => (x.hooks || []).some((hk) => hk.command === want) && (x.matcher || '') === (g.matcher || ''));
+      if (!present) { st.hooks[ev].push(g); added++; }
+    }
+  }
+  if (!added) return;
+  try {
+    if (fs.existsSync(file)) fs.copyFileSync(file, file + '.bak-agentdeck-hooks');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(st, null, 2) + '\n'); // écriture en place : garde un éventuel lien symbolique
+    console.log(`hooks Claude installés (${added}) dans ${file}`);
+  } catch (e) { console.error('hooks Claude :', e.message); }
+}
+ensureHooks();
 
 let TOKEN;
 try { TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); }
@@ -82,7 +234,7 @@ async function discoverProjects(force) {
     }
   }
   for (const p of config.extra) if (fs.existsSync(p)) add(p);
-  const list = await Promise.all([...found].map(async ([id, p]) => ({ id, path: p, name: path.basename(p), parked: config.parked.includes(p), lastActivity: await lastActivity(p) })));
+  const list = await Promise.all([...found].map(async ([id, p]) => ({ id, path: p, name: path.basename(p), parked: config.parked.includes(p), account: projectAccount(p).key, lastActivity: await lastActivity(p) })));
   list.sort((a, b) => b.lastActivity - a.lastActivity);
   projectCache = { at: Date.now(), list };
   return list;
@@ -268,10 +420,11 @@ async function resumableConversations(project) {
 
 const resumeCmd = (key, sid, project) => `${baseCmd(key === 'continue' ? 'claude' : key)} ${hasTranscript(project, sid) ? '--resume' : '--session-id'} ${sid}`;
 
-async function spawnSlot(name, cwd, cmd, size = {}) {
+async function spawnSlot(name, cwd, cmd, size = {}, account = getAccount('default')) {
+  await clearAttention(name);
   const cols = Math.max(20, Math.min(500, Number(size.cols) || 160));
   const rows = Math.max(5, Math.min(200, Number(size.rows) || 40));
-  await tmux('new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), '-e', 'AGENTDECK_SESSION=' + name, 'bash', '-l');
+  await tmux('new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), '-e', 'AGENTDECK_SESSION=' + name, '-e', 'AGENTDECK_ACCOUNT=' + account.key, ...accountEnv(account), 'bash', '-l');
   if (cmd) await tmux('send-keys', '-t', '=' + name + ':', cmd, 'Enter');
 }
 
@@ -290,7 +443,7 @@ async function restoreSlots() {
     const sid = currentSessionId(name, rec);
     let cmd = commandOf(rec.cmdKey);
     if (/^claude\b/.test(cmd) && sid) cmd = resumeCmd(rec.cmdKey, sid, rec.project);
-    try { await spawnSlot(name, rec.project, cmd); console.log('restauré', name, sid || ''); } catch (e) { console.error('restauration', name, e.message); }
+    try { await spawnSlot(name, rec.project, cmd, {}, getAccount(rec.account || projectAccount(rec.project).key)); console.log('restauré', name, sid || ''); } catch (e) { console.error('restauration', name, e.message); }
   }
   saveSlots();
 }
@@ -342,7 +495,7 @@ const withProject = (fn) => wrap(async (req, res) => {
   return fn(req, res, p);
 });
 
-app.get('/api/config', (req, res) => res.json({ host: os.hostname(), slots: SLOTS, staleDays: config.staleDays, commands: config.commands.map(({ key, label }) => ({ key, label })) }));
+app.get('/api/config', (req, res) => res.json({ host: os.hostname(), slots: SLOTS, staleDays: config.staleDays, commands: config.commands.map(({ key, label }) => ({ key, label })), accounts: config.accounts, projectAccounts: config.projectAccounts, accountSwitch: config.accountSwitch, cloneRoot: cloneRoot(), voice: config.voice }));
 
 app.get('/api/projects', wrap(async (req, res) => res.json(await discoverProjects(req.query.refresh === '1'))));
 
@@ -382,7 +535,8 @@ app.get('/api/status', wrap(async (req, res) => {
   for (const [name, s] of Object.entries(sessions)) {
     const m = /^ad_([0-9a-f]{10})_(\d)$/.exec(name);
     if (!m) continue;
-    (out[m[1]] ||= {})[m[2]] = s;
+    const rec = slotsState[name];
+    (out[m[1]] ||= {})[m[2]] = { ...s, account: (rec && rec.account) || 'default', attention: await readAttention(name) };
   }
   const resumable = {};
   for (const [name, rec] of Object.entries(slotsState)) {
@@ -390,6 +544,323 @@ app.get('/api/status', wrap(async (req, res) => {
     if (m && !sessions[name] && currentSessionId(name, rec)) (resumable[m[1]] ||= {})[m[2]] = true;
   }
   res.json({ now: Date.now(), sessions: out, resumable });
+}));
+
+// ---------- usage Claude (limites du plan) ----------
+// Même source que /usage dans Claude Code : l'API OAuth de claude.ai, interrogée avec le token que Claude Code
+// garde dans ~/.claude/.credentials.json (il le rafraîchit lui-même tant qu'une session tourne). Endpoint non
+// documenté : on reste défensif et on garde la dernière réponse valide si l'appel échoue.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_TTL = 60000;
+const usageCaches = new Map(); // clé du compte -> { at, data, error }
+const USAGE_LABELS = { session: 'Session · 5 h', weekly_all: 'Semaine', weekly_scoped: 'Semaine' };
+async function fetchUsage(account = getAccount('default')) {
+  let usageCache = usageCaches.get(account.key) || { at: 0, data: null, error: null };
+  if (Date.now() - usageCache.at < USAGE_TTL) return usageCache;
+  let creds;
+  try { creds = JSON.parse(await fsp.readFile(path.join(accountDir(account), '.credentials.json'), 'utf8')).claudeAiOauth; } catch {}
+  if (!creds || !creds.accessToken) {
+    usageCache = { at: Date.now(), data: null, error: 'compte non connecté' };
+    usageCaches.set(account.key, usageCache);
+    return usageCache;
+  }
+  try {
+    const r = await fetch(USAGE_URL, {
+      headers: { authorization: 'Bearer ' + creds.accessToken, 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) throw new Error(r.status === 401 ? 'token Claude expiré : ouvre un agent pour le rafraîchir' : 'API usage : HTTP ' + r.status);
+    const j = await r.json();
+    const limits = (Array.isArray(j.limits) ? j.limits : []).map((l) => ({
+      kind: l.kind,
+      label: l.kind === 'weekly_scoped' && l.scope && l.scope.model ? `${l.scope.model.display_name || 'Modèle'} · semaine` : USAGE_LABELS[l.kind] || l.kind,
+      percent: Math.max(0, Math.min(100, Number(l.percent) || 0)),
+      resetsAt: l.resets_at ? Date.parse(l.resets_at) : null,
+      severity: l.severity || 'normal',
+      active: !!l.is_active,
+    }));
+    // Anciens champs si `limits` est absent
+    if (!limits.length) {
+      for (const [k, kind] of [['five_hour', 'session'], ['seven_day', 'weekly_all']]) {
+        if (j[k]) limits.push({ kind, label: USAGE_LABELS[kind], percent: Math.round(Number(j[k].utilization) || 0), resetsAt: j[k].resets_at ? Date.parse(j[k].resets_at) : null, severity: 'normal', active: false });
+      }
+    }
+    const extra = j.extra_usage && j.extra_usage.is_enabled ? { percent: Number(j.extra_usage.utilization) || 0, used: j.extra_usage.used_credits, limit: j.extra_usage.monthly_limit, currency: j.extra_usage.currency } : null;
+    usageCache = { at: Date.now(), error: null, data: { plan: creds.subscriptionType || null, tier: creds.rateLimitTier || null, limits, extra } };
+  } catch (e) {
+    usageCache = { at: Date.now(), data: usageCache.data, error: e.name === 'TimeoutError' ? 'API usage injoignable' : e.message };
+  }
+  usageCaches.set(account.key, usageCache);
+  return usageCache;
+}
+
+app.get('/api/usage', wrap(async (req, res) => {
+  const u = await fetchUsage(getAccount(req.query.account || 'default'));
+  res.json({ now: Date.now(), at: u.at, stale: !!(u.error && u.data), error: u.error, ...(u.data || { plan: null, limits: [], extra: null }) });
+}));
+
+// ---------- comptes : API ----------
+// Tous les comptes avec identité, usage et nombre de projets/agents qui s'en servent
+app.get('/api/accounts', wrap(async (req, res) => {
+  const [live, projects] = await Promise.all([listSessions(), discoverProjects()]);
+  const out = await Promise.all(config.accounts.map(async (a) => {
+    const [id, u] = await Promise.all([accountIdentity(a), fetchUsage(a)]);
+    const usage = u.data || { plan: null, limits: [], extra: null };
+    return {
+      key: a.key, label: a.label, isDefault: a.key === 'default', ...id,
+      plan: usage.plan || id.plan, tier: usage.tier || id.tier,
+      usage: { limits: usage.limits, extra: usage.extra, error: u.error, stale: !!(u.error && u.data), at: u.at },
+      projects: a.key === 'default' ? projects.filter((p) => !config.projectAccounts[p.path]).length : projects.filter((p) => config.projectAccounts[p.path] === a.key).length,
+      agents: Object.entries(slotsState).filter(([n, r]) => live[n] && ((r.account || 'default') === a.key)).length,
+      loginOpen: !!live[loginSession(a.key)],
+    };
+  }));
+  res.json({ now: Date.now(), accounts: out, projectAccounts: config.projectAccounts });
+}));
+
+app.post('/api/accounts', wrap(async (req, res) => {
+  const a = await createAccount(req.body && req.body.label);
+  res.json(a);
+}));
+
+app.patch('/api/accounts/:key', wrap(async (req, res) => {
+  const a = config.accounts.find((x) => x.key === req.params.key);
+  if (!a) return res.status(404).json({ error: 'compte inconnu' });
+  const label = String((req.body && req.body.label) || '').trim();
+  if (label) a.label = label;
+  saveConfig();
+  res.json(a);
+}));
+
+app.delete('/api/accounts/:key', wrap(async (req, res) => {
+  await removeAccount(req.params.key);
+  usageCaches.delete(req.params.key);
+  res.json({ ok: true });
+}));
+
+// Connexion : une session tmux dédiée lance `claude auth login` dans l'environnement du compte ; le navigateur s'y
+// attache (ws/term?login=<clé>) pour afficher l'URL OAuth et saisir le code. Elle se ferme toute seule à la fin.
+app.post('/api/accounts/:key/login', wrap(async (req, res) => {
+  const a = config.accounts.find((x) => x.key === req.params.key);
+  if (!a) return res.status(404).json({ error: 'compte inconnu' });
+  const name = loginSession(a.key);
+  if (!(await hasSession(name))) {
+    const cols = Math.max(40, Math.min(300, Number(req.body && req.body.cols) || 100));
+    const rows = Math.max(10, Math.min(100, Number(req.body && req.body.rows) || 30));
+    const script = 'claude auth logout >/dev/null 2>&1; claude auth login; s=$?; echo; if [ $s = 0 ]; then claude auth status --text; echo; echo "✔ Connecté — fermeture dans 4 s"; else echo "✖ Connexion échouée ($s)"; fi; sleep 4';
+    await tmux('new-session', '-d', '-s', name, '-c', HOME, '-x', String(cols), '-y', String(rows), ...accountEnv(a), 'bash', '-lc', script);
+  }
+  usageCaches.delete(a.key);
+  res.json({ ok: true, session: name });
+}));
+
+app.post('/api/account-switch', wrap(async (req, res) => {
+  const b = req.body || {};
+  config.accountSwitch = { enabled: !!b.enabled, threshold: Math.max(10, Math.min(100, Number(b.threshold) || 80)) };
+  saveConfig();
+  res.json(config.accountSwitch);
+}));
+
+// ---------- dépôts : GitHub (via gh) et URL git ----------
+// Setup « tout simple » : connecte GitHub une fois (gh auth login, dans une fenêtre terminal), puis clone tes
+// dépôts dans le dossier des projets d'un clic. gh garde le token et sert d'assistant d'identifiants à git.
+function cloneRoot() {
+  const pref = config.roots.find((r) => r !== HOME && fs.existsSync(r)) || config.roots.find((r) => r !== HOME) || path.join(HOME, 'projects');
+  return pref;
+}
+let ghCache = { at: 0, data: null };
+async function ghStatus() {
+  const out = { installed: false, loggedIn: false, user: null, host: 'github.com' };
+  try { await run('gh', ['--version']); out.installed = true; } catch { return out; }
+  try {
+    const j = JSON.parse(await run('gh', ['api', 'user', '--jq', '{login: .login, name: .name}'], { timeout: 8000 }));
+    out.loggedIn = true; out.user = j.login;
+  } catch {}
+  return out;
+}
+app.get('/api/repos/status', wrap(async (req, res) => res.json({ ...(await ghStatus()), cloneRoot: cloneRoot(), loginOpen: !!(await listSessions())[loginSession('gh')] })));
+
+app.get('/api/repos', wrap(async (req, res) => {
+  if (req.query.refresh !== '1' && Date.now() - ghCache.at < 120000 && ghCache.data) return res.json(ghCache.data);
+  const fields = 'nameWithOwner,description,updatedAt,isPrivate,url,isFork,isArchived';
+  let repos = [];
+  try {
+    repos = JSON.parse(await run('gh', ['repo', 'list', '--limit', '300', '--json', fields], { timeout: 30000 }));
+    // dépôts des organisations aussi, sans bloquer si ça échoue
+    try {
+      const orgs = JSON.parse(await run('gh', ['api', 'user/orgs', '--jq', '[.[].login]'], { timeout: 8000 }));
+      for (const o of orgs.slice(0, 10)) {
+        try { repos.push(...JSON.parse(await run('gh', ['repo', 'list', o, '--limit', '200', '--json', fields], { timeout: 20000 }))); } catch {}
+      }
+    } catch {}
+  } catch (e) { return res.status(502).json({ error: 'gh : ' + ((e.stderr || e.message || '').trim().split('\n')[0]) }); }
+  const root = cloneRoot();
+  const existing = new Set((await discoverProjects()).map((p) => path.basename(p.path).toLowerCase()));
+  const data = repos.filter((r) => !r.isArchived).map((r) => ({
+    name: r.nameWithOwner, description: r.description || '', updatedAt: Date.parse(r.updatedAt) || 0, private: !!r.isPrivate, fork: !!r.isFork, url: r.url,
+    cloned: existing.has(r.nameWithOwner.split('/')[1].toLowerCase()) || fs.existsSync(path.join(root, r.nameWithOwner.split('/')[1])),
+  })).sort((a, b) => b.updatedAt - a.updatedAt);
+  ghCache = { at: Date.now(), data };
+  res.json(data);
+}));
+
+const cloning = new Set();
+app.post('/api/repos/clone', wrap(async (req, res) => {
+  let src = String((req.body && (req.body.repo || req.body.url)) || '').trim();
+  if (!src) return res.status(400).json({ error: 'dépôt manquant' });
+  const isName = /^[\w.-]+\/[\w.-]+$/.test(src);
+  if (!isName && !/^(https?:\/\/|git@|ssh:\/\/)[^\s]+$/.test(src)) return res.status(400).json({ error: 'dépôt ou URL git invalide' });
+  const base = (isName ? src.split('/')[1] : src.replace(/\/+$/, '').split(/[\/:]/).pop()).replace(/\.git$/, '');
+  if (!/^[\w.-]+$/.test(base) || base.startsWith('.')) return res.status(400).json({ error: 'nom de dossier invalide' });
+  const root = cloneRoot();
+  const dest = path.join(root, base);
+  if (fs.existsSync(dest)) return res.status(409).json({ error: `le dossier ${dest} existe déjà` });
+  if (cloning.has(dest)) return res.status(409).json({ error: 'clonage déjà en cours' });
+  cloning.add(dest);
+  try {
+    await fsp.mkdir(root, { recursive: true });
+    if (isName) await run('gh', ['repo', 'clone', src, dest], { timeout: 600000 });
+    else await run('git', ['clone', src, dest], { timeout: 600000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  } catch (e) {
+    await fsp.rm(dest, { recursive: true, force: true }).catch(() => {});
+    return res.status(502).json({ error: 'clone : ' + ((e.stderr || e.message || '').trim().split('\n').filter(Boolean).pop() || 'échec') });
+  } finally { cloning.delete(dest); }
+  if (!config.roots.includes(root) && !config.extra.includes(dest)) { config.extra.push(dest); saveConfig(); }
+  ghCache.at = 0;
+  await discoverProjects(true);
+  res.json({ id: projId(dest), path: dest, name: base });
+}));
+
+// Connexion GitHub : fenêtre terminal sur `gh auth login` (code à saisir sur github.com), puis git utilise gh pour s'identifier
+app.post('/api/repos/login', wrap(async (req, res) => {
+  const name = loginSession('gh');
+  if (!(await hasSession(name))) {
+    const cols = Math.max(40, Math.min(300, Number(req.body && req.body.cols) || 100));
+    const rows = Math.max(10, Math.min(100, Number(req.body && req.body.rows) || 30));
+    const script = 'gh auth login --hostname github.com --git-protocol https --web; s=$?; echo; if [ $s = 0 ]; then gh auth setup-git; gh auth status; echo; echo "✔ GitHub connecté — fermeture dans 4 s"; else echo "✖ Connexion échouée ($s)"; fi; sleep 4';
+    await tmux('new-session', '-d', '-s', name, '-c', HOME, '-x', String(cols), '-y', String(rows), 'bash', '-lc', script);
+  }
+  res.json({ ok: true, session: name });
+}));
+
+// ---------- contrôle vocal ----------
+// Une seule entrée (voix ou texte). Un Claude headless (claude -p, abonnement, pas d'outils) reçoit l'état des
+// projets et agents et décide : envoyer l'instruction à un agent qui tourne, en démarrer un, ou juste répondre.
+const VOICE_SCHEMA = JSON.stringify({
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['send', 'start', 'reply'] },
+    projectId: { type: 'string' },
+    slot: { type: 'integer' },
+    instruction: { type: 'string' },
+    reply: { type: 'string' },
+  },
+  required: ['action', 'reply'],
+});
+const VOICE_SYSTEM = `Tu es le dispatcher vocal d'Agent Deck, un cockpit qui pilote plusieurs agents Claude Code (jusqu'à 4 par projet, numérotés 1 à 4) sur un serveur.
+L'utilisateur parle à voix haute ; sa phrase a été transcrite, elle peut contenir des erreurs de reconnaissance (noms de projets approximatifs, homophones). Devine le projet visé par ressemblance.
+Tu reçois l'état des projets et des agents (état + dernières lignes de terminal). Décide :
+- "send" : transmettre l'instruction à un agent qui tourne déjà (projectId + slot 0-3). Préfère l'agent dont le terminal montre qu'il travaille sur le sujet, sinon un agent qui attend. Un agent en attente d'autorisation ("perm") attend une réponse comme "oui"/"y" : si l'utilisateur dit d'accepter, envoie "y".
+- "start" : démarrer un nouvel agent dans un projet (projectId) avec l'instruction, si aucun agent de ce projet ne convient ou si l'utilisateur le demande.
+- "reply" : si la demande est une question sur l'état (qui travaille sur quoi, qui attend) ou si tu ne peux pas déterminer la cible : réponds ou demande une précision, sans rien envoyer.
+"instruction" : la consigne reformulée proprement pour l'agent (impérative, claire, en français ou dans la langue de l'utilisateur), pas la transcription brute. Jamais de retour à la ligne.
+"reply" : une phrase courte qui sera lue à voix haute : ce que tu as fait ou la réponse. Nomme le projet et le numéro d'agent (1-4, soit slot+1). Pas de markdown.`;
+
+const shq = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
+async function paneTail(name, lines = 12) {
+  try {
+    const out = await tmux('capture-pane', '-p', '-J', '-t', '=' + name + ':', '-S', String(-lines));
+    return out.split('\n').map((l) => l.replace(/\s+$/, '')).filter(Boolean).slice(-lines).join('\n').slice(-700);
+  } catch { return ''; }
+}
+async function voiceContext(currentId) {
+  const [projects, live] = await Promise.all([discoverProjects(), listSessions()]);
+  const now = Date.now();
+  const lines = [];
+  const withAgents = [], others = [];
+  for (const p of projects) {
+    const names = Array.from({ length: SLOTS }, (_, i) => sessionName(p.id, i));
+    (names.some((n) => live[n]) ? withAgents : others).push(p);
+  }
+  lines.push(`Projet affiché à l'écran : ${currentId || 'aucun'}`);
+  lines.push('', '## Projets avec agents en cours');
+  for (const p of withAgents) {
+    lines.push(`### ${p.name} (projectId=${p.id}, ${p.path})`);
+    for (let i = 0; i < SLOTS; i++) {
+      const n = sessionName(p.id, i);
+      if (!live[n]) { lines.push(`- agent ${i + 1} (slot ${i}) : libre`); continue; }
+      const s = live[n];
+      const att = await readAttention(n);
+      const state = now - s.activity < 3500 ? 'busy (travaille)' : att ? (att.kind === 'permission' ? 'perm (attend une autorisation / réponse)' : 'done (a fini, attend une consigne)') : 'idle';
+      const tail = await paneTail(n);
+      lines.push(`- agent ${i + 1} (slot ${i}) : ${state}${s.command && s.command !== 'claude' ? ` [${s.command}]` : ''}`);
+      if (tail) lines.push('  terminal :', ...tail.split('\n').map((l) => '    ' + l));
+    }
+  }
+  lines.push('', '## Autres projets (aucun agent lancé, action "start" possible)');
+  for (const p of others.filter((p) => !p.parked).slice(0, 40)) lines.push(`- ${p.name} (projectId=${p.id})`);
+  return lines.join('\n');
+}
+
+async function runDispatcher(text, currentId) {
+  const context = await voiceContext(currentId);
+  const prompt = `${context}\n\n## Demande de l'utilisateur (transcription vocale)\n${text}`;
+  const env = { ...process.env };
+  delete env.AGENTDECK_SESSION; delete env.CLAUDE_CONFIG_DIR;
+  const args = ['-p', '--no-session-persistence', '--output-format', 'json', '--json-schema', VOICE_SCHEMA, '--model', (config.voice && config.voice.model) || 'sonnet',
+    '--tools', '', '--max-turns', '1', '--system-prompt', VOICE_SYSTEM, prompt];
+  const raw = await run('claude', args, { cwd: HOME, env, timeout: 90000 });
+  let j; try { j = JSON.parse(raw); } catch { throw new Error('dispatcher : réponse illisible'); }
+  if (j.is_error) throw new Error('dispatcher : ' + String(j.result || 'erreur').slice(0, 200));
+  let d = j.structured_output;
+  if (!d) { try { d = JSON.parse(String(j.result).replace(/^```(?:json)?|```$/g, '').trim()); } catch { throw new Error('dispatcher : pas de JSON'); } }
+  return d;
+}
+
+app.post('/api/voice/dispatch', wrap(async (req, res) => {
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 2000);
+  if (!text) return res.status(400).json({ error: 'rien entendu' });
+  const d = await runDispatcher(text, req.body.current);
+  const out = { action: d.action, reply: String(d.reply || '').trim(), instruction: d.instruction || null, projectId: d.projectId || null, slot: Number.isInteger(d.slot) ? d.slot : null };
+  const p = d.projectId ? (await discoverProjects()).find((x) => x.id === d.projectId) : null;
+  if ((d.action === 'send' || d.action === 'start') && !p) { out.action = 'reply'; out.reply = out.reply || 'Je ne trouve pas ce projet.'; return res.json(out); }
+  const instruction = String(d.instruction || '').replace(/\s*\n+\s*/g, ' ').trim();
+  if (d.action === 'send') {
+    const name = sessionName(p.id, out.slot);
+    if (!(out.slot >= 0 && out.slot < SLOTS) || !(await hasSession(name))) { out.action = 'reply'; out.reply = `L'agent ${out.slot + 1} de ${p.name} ne tourne pas.`; return res.json(out); }
+    if (!instruction) { out.action = 'reply'; return res.json(out); }
+    await tmux('send-keys', '-t', '=' + name + ':', '-l', instruction);
+    await new Promise((r) => setTimeout(r, 150)); // laisse le TUI absorber le texte avant Entrée
+    await tmux('send-keys', '-t', '=' + name + ':', 'Enter');
+    voiceTargets.set(name, Date.now());
+    await clearAttention(name);
+  } else if (d.action === 'start') {
+    const live = await listSessions();
+    const slot = Array.from({ length: SLOTS }, (_, i) => i).find((i) => !live[sessionName(p.id, i)]);
+    if (slot == null) { out.action = 'reply'; out.reply = `Les 4 agents de ${p.name} sont déjà pris.`; return res.json(out); }
+    const name = sessionName(p.id, slot);
+    const sid = crypto.randomUUID();
+    const cmd = `${commandOf('claude')} --session-id ${sid}${instruction ? ' ' + shq(instruction) : ''}`;
+    const { account } = await pickAccount(projectAccount(p.path));
+    await spawnSlot(name, p.path, cmd, req.body || {}, account);
+    slotsState[name] = { project: p.path, slot, cmdKey: 'claude', sessionId: sid, account: account.key, stopped: false, startedAt: Date.now() };
+    writeSessionFile(name, sid); saveSlots();
+    if (autoState.suppressed.includes(p.path)) { autoState.suppressed = autoState.suppressed.filter((x) => x !== p.path); saveAuto(); }
+    voiceTargets.set(name, Date.now());
+    out.slot = slot; out.started = true;
+  }
+  if (p) { out.projectId = p.id; out.projectName = p.name; }
+  res.json(out);
+}));
+
+// Compte utilisé par défaut pour les agents d'un projet (les agents déjà lancés ne changent pas)
+app.post('/api/projects/:id/account', withProject(async (req, res, p) => {
+  const key = req.body && req.body.account;
+  if (!config.accounts.some((a) => a.key === key)) return res.status(400).json({ error: 'compte inconnu' });
+  if (key === 'default') delete config.projectAccounts[p.path]; else config.projectAccounts[p.path] = key;
+  saveConfig();
+  await discoverProjects(true);
+  res.json({ ok: true, account: key });
 }));
 
 app.post('/api/projects/:id/slots/:slot/start', withProject(async (req, res, p) => {
@@ -410,12 +881,15 @@ app.post('/api/projects/:id/slots/:slot/start', withProject(async (req, res, p) 
     cmd = commandOf(key);
     if (key !== 'continue' && /^claude\b/.test(cmd)) { sid = crypto.randomUUID(); cmd += ` --session-id ${sid}`; }
   }
-  await spawnSlot(name, p.path, cmd, req.body);
+  // Compte choisi explicitement dans l'emplacement : respecté. Sinon celui du projet, avec bascule auto éventuelle.
+  const explicit = req.body && req.body.account && req.body.account !== projectAccount(p.path).key;
+  const { account, switched } = explicit ? { account: getAccount(req.body.account), switched: false } : await pickAccount(projectAccount(p.path));
+  await spawnSlot(name, p.path, cmd, req.body, account);
   if (autoState.suppressed.includes(p.path)) { autoState.suppressed = autoState.suppressed.filter((x) => x !== p.path); saveAuto(); }
-  slotsState[name] ={ project: p.path, slot, cmdKey: key, sessionId: sid, stopped: false, startedAt: Date.now() };
+  slotsState[name] = { project: p.path, slot, cmdKey: key, sessionId: sid, account: account.key, stopped: false, startedAt: Date.now() };
   if (sid) writeSessionFile(name, sid);
   saveSlots();
-  res.json({ ok: true });
+  res.json({ ok: true, account: account.key, switched });
 }));
 
 app.post('/api/projects/:id/slots/:slot/stop', withProject(async (req, res, p) => {
@@ -448,8 +922,9 @@ app.post('/api/projects/:id/autoresume', withProject(async (req, res, p) => {
     const pick = (recent.length ? recent : cands.slice(0, 1)).slice(0, Math.min(ar.max, SLOTS));
     const started = [];
     for (let i = 0; i < pick.length; i++) {
-      await spawnSlot(names[i], p.path, resumeCmd('claude', pick[i].sid, p.path), req.body || {});
-      slotsState[names[i]] = { project: p.path, slot: i, cmdKey: 'claude', sessionId: pick[i].sid, stopped: false, startedAt: Date.now() };
+      const { account } = await pickAccount(projectAccount(p.path));
+      await spawnSlot(names[i], p.path, resumeCmd('claude', pick[i].sid, p.path), req.body || {}, account);
+      slotsState[names[i]] = { project: p.path, slot: i, cmdKey: 'claude', sessionId: pick[i].sid, account: account.key, stopped: false, startedAt: Date.now() };
       writeSessionFile(names[i], pick[i].sid);
       started.push(i);
     }
@@ -521,8 +996,13 @@ app.get('/api/projects/:id/file', withProject(async (req, res, p) => {
 app.get('/api/projects/:id/raw', withProject(async (req, res, p) => {
   const abs = resolveIn(p.path, req.query.path);
   const ext = path.extname(abs).slice(1).toLowerCase();
+  const st = await fsp.stat(abs);
+  if (st.isDirectory()) return res.status(400).json({ error: 'est un dossier' });
   res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
+  res.setHeader('Content-Length', st.size);
   res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'"); // SVG inertes
+  // ?download=1 : téléchargement forcé, avec le vrai nom de fichier (même pour les images/PDF que le navigateur afficherait)
+  if (req.query.download) res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(abs))}`);
   fs.createReadStream(abs).on('error', () => res.status(404).end()).pipe(res);
 }));
 
@@ -560,15 +1040,22 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 async function onTerminal(ws, url) {
-  const p = await getProject(url.searchParams.get('project'));
-  const slot = Number(url.searchParams.get('slot'));
-  if (!p || !(slot >= 0 && slot < SLOTS)) return ws.close(4004, 'introuvable');
-  const name = sessionName(p.id, slot);
+  let name, cwd;
+  const loginKey = url.searchParams.get('login');
+  if (loginKey) {
+    if (loginKey !== 'gh' && !config.accounts.some((a) => a.key === loginKey)) return ws.close(4004, 'introuvable');
+    name = loginSession(loginKey); cwd = HOME;
+  } else {
+    const p = await getProject(url.searchParams.get('project'));
+    const slot = Number(url.searchParams.get('slot'));
+    if (!p || !(slot >= 0 && slot < SLOTS)) return ws.close(4004, 'introuvable');
+    name = sessionName(p.id, slot); cwd = p.path;
+  }
   if (!(await hasSession(name))) return ws.close(4010, 'pas de session');
   const cols = Number(url.searchParams.get('cols')) || 120;
   const rows = Number(url.searchParams.get('rows')) || 30;
   const term = pty.spawn('tmux', ['-L', TMUX_SOCK, '-f', TMUX_CONF, 'attach-session', '-t', '=' + name], {
-    name: 'xterm-256color', cols, rows, cwd: p.path, env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
   });
   term.onData((d) => { if (ws.readyState === 1) ws.send(d); });
   term.onExit(() => { if (ws.readyState === 1) ws.close(1000, 'fin'); });
