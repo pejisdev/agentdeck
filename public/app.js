@@ -200,6 +200,18 @@ class Pane {
     this.teardown(); pollStatus();
   }
 
+  async pasteImage(file) {
+    if (!file || !this.ws || this.ws.readyState !== WebSocket.OPEN) return toast('Terminal non connecté', true);
+    toast(`Envoi de l'image (${(file.size / 1024).toFixed(0)} Ko)…`);
+    try {
+      const r = await fetch(`${P(this.deck.id)}/paste`, { method: 'POST', headers: { 'content-type': file.type }, body: file });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      this.send({ t: 'i', d: j.path + ' ' });
+      this.term && this.term.focus();
+    } catch (e) { toast('Collage impossible : ' + e.message, true); }
+  }
+
   toggleMax() {
     const on = !this.el.classList.contains('max');
     this.deck.panes.forEach((p) => p.el.classList.remove('max'));
@@ -230,10 +242,21 @@ class Pane {
       // Laisse passer nos raccourcis globaux
       if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && ['p', 'b'].includes(e.key.toLowerCase()) && !e.shiftKey) return false;
       if (e.type === 'keydown' && e.altKey && /^[1-4]$/.test(e.key)) return false;
+      // Shift+Entrée : nouvelle ligne dans Claude Code. xterm.js enverrait un simple CR (indistinguable d'Entrée),
+      // on envoie ESC+CR (Meta+Entrée), ce que /terminal-setup configure aussi dans iTerm2/VS Code.
+      if (e.type === 'keydown' && e.shiftKey && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.metaKey) { this.send({ t: 'i', d: '\x1b\r' }); return false; }
       // Ctrl+Shift+C / V : copier-coller
       if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') { navigator.clipboard.writeText(term.getSelection()); return false; }
       return true;
     });
+    // Collage d'image : Claude Code ne voit pas le presse-papiers du navigateur, on envoie l'image au serveur
+    // puis on tape le chemin du fichier dans le terminal (Claude la lit comme un fichier image).
+    holder.addEventListener('paste', (e) => {
+      const item = [...(e.clipboardData && e.clipboardData.items || [])].find((it) => it.kind === 'file' && /^image\/(png|jpeg|gif|webp)$/.test(it.type));
+      if (!item) return; // texte : xterm gère
+      e.preventDefault(); e.stopPropagation();
+      this.pasteImage(item.getAsFile());
+    }, true);
     term.textarea && term.textarea.addEventListener('focus', () => this.setFocus());
     this.term = term;
     document.fonts && document.fonts.ready.then(() => this.scheduleFit());
