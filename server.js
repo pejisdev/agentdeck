@@ -23,7 +23,7 @@ const TOKEN_FILE = path.join(DATA, 'token');
 const TMUX_SOCK = 'agentdeck';
 const TMUX_CONF = path.join(__dirname, 'tmux.conf');
 const SLOTS = 4;
-const IGNORE = new Set(['.git', 'node_modules', '.next', 'dist', 'build', 'target', '__pycache__', '.venv', 'venv', '.cache', '.turbo', 'coverage', '.pnpm-store']);
+const IGNORE = new Set(['.git', '.agentdeck', 'node_modules', '.next', 'dist', 'build', 'target', '__pycache__', '.venv', 'venv', '.cache', '.turbo', 'coverage', '.pnpm-store']);
 const PROJECT_MARKERS = ['.git', 'CLAUDE.md', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'requirements.txt', 'foundry.toml'];
 const MAX_FILE = 5 * 1024 * 1024;
 
@@ -479,6 +479,31 @@ app.get('/api/projects/:id/files', withProject(async (req, res, p) => res.json(a
 app.get('/api/projects/:id/stat', withProject(async (req, res, p) => {
   const st = await fsp.stat(resolveIn(p.path, req.query.path)).catch(() => null);
   res.json(st ? { exists: true, mtime: st.mtimeMs, size: st.size } : { exists: false });
+}));
+
+// Image collée dans un terminal : Claude Code lit le presse-papiers de la machine où il tourne (ce VPS, sans
+// presse-papiers), donc le navigateur envoie l'image ici ; on la range dans le projet et le client tape son chemin.
+const PASTE_DIR = '.agentdeck/pastes';
+const PASTE_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+app.post('/api/projects/:id/paste', express.raw({ type: Object.keys(PASTE_EXT), limit: '20mb' }), withProject(async (req, res, p) => {
+  const ext = PASTE_EXT[(req.headers['content-type'] || '').split(';')[0]];
+  if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'image attendue (png, jpeg, gif, webp)' });
+  const dir = path.join(p.path, PASTE_DIR);
+  await fsp.mkdir(dir, { recursive: true });
+  // Exclusion git locale (jamais commitée) pour ne pas polluer le statut du projet
+  const exclude = path.join(p.path, '.git/info/exclude');
+  if (fs.existsSync(path.dirname(exclude))) {
+    const cur = fs.existsSync(exclude) ? await fsp.readFile(exclude, 'utf8') : '';
+    if (!cur.split('\n').includes('.agentdeck/')) await fsp.appendFile(exclude, (cur && !cur.endsWith('\n') ? '\n' : '') + '.agentdeck/\n');
+  }
+  // Ménage : on garde une semaine d'images
+  for (const f of await fsp.readdir(dir).catch(() => [])) {
+    const st = await fsp.stat(path.join(dir, f)).catch(() => null);
+    if (st && Date.now() - st.mtimeMs > 7 * 86400e3) await fsp.unlink(path.join(dir, f)).catch(() => {});
+  }
+  const name = `paste-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-')}-${crypto.randomBytes(2).toString('hex')}.${ext}`;
+  await fsp.writeFile(path.join(dir, name), req.body);
+  res.json({ path: `${PASTE_DIR}/${name}`, size: req.body.length });
 }));
 
 app.get('/api/projects/:id/file', withProject(async (req, res, p) => {
