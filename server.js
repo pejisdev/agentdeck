@@ -516,9 +516,11 @@ app.post('/api/projects', wrap(async (req, res) => {
   res.json({ id: projId(p), path: p, name: path.basename(p) });
 }));
 
+// « Au repos » : arrête tous les agents du projet (sans reprise auto) et le range tout en bas de la liste
 app.post('/api/projects/:id/park', withProject(async (req, res, p) => {
+  const parked = !!(req.body && req.body.parked);
   config.parked = config.parked.filter((x) => x !== p.path);
-  if (req.body && req.body.parked) config.parked.push(p.path);
+  if (parked) { config.parked.push(p.path); await stopProject(p); }
   saveConfig();
   await discoverProjects(true);
   res.json({ ok: true });
@@ -896,18 +898,26 @@ app.post('/api/projects/:id/slots/:slot/start', withProject(async (req, res, p) 
   res.json({ ok: true, account: account.key, switched });
 }));
 
-app.post('/api/projects/:id/slots/:slot/stop', withProject(async (req, res, p) => {
-  const name = sessionName(p.id, Number(req.params.slot));
+// Arrêt voulu d'un agent : tue la session tmux, pas de reprise auto de cette conversation.
+// Et si plus rien ne tourne dans le projet, on n'y relance plus rien tant que tu n'y démarres pas un agent toi-même.
+async function stopSlot(p, slot) {
+  const name = sessionName(p.id, slot);
   const rec = slotsState[name];
-  if (rec) { rec.stopped = true; saveSlots(); } // arrêt voulu : pas de reprise auto
+  if (rec) { rec.stopped = true; saveSlots(); }
   try { await tmux('kill-session', '-t', '=' + name); } catch {}
-  // Conversation fermée à la main : on ne la relancera plus à l'ouverture du projet.
-  // Et si plus rien ne tourne dans le projet, on n'y relance plus rien tant que tu n'y démarres pas un agent toi-même.
   const sid = rec && currentSessionId(name, rec);
   if (sid) autoState.dismissed = [...new Set([...autoState.dismissed, sid])].slice(-500);
   const live = await listSessions();
   if (!Array.from({ length: SLOTS }, (_, i) => sessionName(p.id, i)).some((n) => live[n])) autoState.suppressed = [...new Set([...autoState.suppressed, p.path])];
   saveAuto();
+}
+async function stopProject(p) {
+  const live = await listSessions();
+  for (let i = 0; i < SLOTS; i++) if (live[sessionName(p.id, i)]) await stopSlot(p, i);
+}
+
+app.post('/api/projects/:id/slots/:slot/stop', withProject(async (req, res, p) => {
+  await stopSlot(p, Number(req.params.slot));
   res.json({ ok: true });
 }));
 

@@ -105,8 +105,8 @@ function renderProjects() {
     }, dots,
       h('div', { class: 'pname' }, h('b', {}, p.name, p.account && p.account !== 'default' ? h('span', { class: 'acct-tag', title: 'Compte Claude : ' + accountLabel(p.account) }, accountLabel(p.account)) : null), h('small', {}, p.path.replace(/^\/home\/[^/]+/, '~'))),
       h('span', { class: 'age', title: p.lastActivity ? new Date(p.lastActivity).toLocaleString('fr-FR') : '' }, ago(p.lastActivity)),
-      h('button', { class: 'x', title: p.parked ? 'Sortir du repos' : 'Envoyer au repos (en bas)', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '⤓'),
-      h('button', { class: 'x', title: 'Masquer ce projet', onclick: (e) => { e.stopPropagation(); hideProject(p); } }, '×'));
+      // La croix met le projet au repos : ses agents sont arrêtés et il descend en bas de la liste
+      h('button', { class: 'x', title: p.parked ? 'Sortir du repos' : 'Mettre au repos : arrête les agents et range le projet en bas', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '×'));
   };
   if (active.length) { list.append(h('li', { class: 'sep' }, 'Actifs')); active.forEach((p) => list.append(row(p))); }
   if (recent.length) { list.append(h('li', { class: 'sep' }, 'Récents')); recent.forEach((p) => list.append(row(p))); }
@@ -132,8 +132,11 @@ async function loadProjects(refresh) {
 }
 
 async function parkProject(p, parked) {
+  const running = S.status[p.id] ? Object.keys(S.status[p.id]).length : 0;
+  if (parked && running && !confirm(`Mettre « ${p.name} » au repos ?\n${running} agent${running > 1 ? 's' : ''} en cours ser${running > 1 ? 'ont' : 'a'} arrêté${running > 1 ? 's' : ''}.`)) return;
   await api(`${P(p.id)}/park`, { method: 'POST', body: { parked } });
-  await loadProjects();
+  await Promise.all([loadProjects(), pollStatus()]);
+  toast(parked ? `${p.name} au repos` : `${p.name} de retour`);
 }
 
 async function hideProject(p) {
