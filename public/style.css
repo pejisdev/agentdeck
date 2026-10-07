@@ -77,7 +77,6 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 #projList li.done .pname b::after { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); margin-left: 6px; vertical-align: middle; }
 #projList .sep { padding: 10px 8px 4px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); cursor: default; }
 #projList .sep:hover { background: none; }
-#projList .sep.toggle { cursor: pointer; }
 #projList .sep.toggle:hover { color: var(--muted); }
 #projList li .age { font-size: 10.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }
 #projList li:hover .age { display: none; }

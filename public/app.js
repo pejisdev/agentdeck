@@ -47,8 +47,6 @@ const S = {
   done: new Set(store.get('done', [])),
   layout: store.get('layout', 'grid'),
   focusPane: null,
-  showOld: store.get('showOld', false),
-  showParked: store.get('showParked', false),
   files: new Map(),         // id -> FileState
   accounts: [],             // comptes Claude (de /api/accounts)
 };
@@ -92,9 +90,9 @@ function renderProjects() {
   const staleBefore = S.now - S.cfg.staleDays * 86400000;
   const active = items.filter((p) => S.status[p.id]);
   const recent = items.filter((p) => !S.status[p.id] && !p.parked && p.lastActivity >= staleBefore);
-  const old = items.filter((p) => !S.status[p.id] && !p.parked && p.lastActivity < staleBefore);
-  const parked = items.filter((p) => !S.status[p.id] && p.parked);
-  const showOld = filter || S.showOld;
+  // Anciens et « au repos » ne s'affichent plus : la liste ne montre que l'actif et le récent.
+  // Ils restent trouvables en tapant leur nom dans le champ de recherche (⤒ pour sortir un projet du repos).
+  const hidden = filter ? items.filter((p) => !S.status[p.id] && (p.parked || p.lastActivity < staleBefore)) : [];
   const row = (p) => {
     const dots = h('div', { class: 'dots' });
     for (let i = 0; i < S.cfg.slots; i++) dots.append(h('i', { class: 'dot ' + slotState(p.id, i) }));
@@ -106,21 +104,11 @@ function renderProjects() {
       h('div', { class: 'pname' }, h('b', {}, p.name, p.account && p.account !== 'default' ? h('span', { class: 'acct-tag', title: 'Compte Claude : ' + accountLabel(p.account) }, accountLabel(p.account)) : null), h('small', {}, p.path.replace(/^\/home\/[^/]+/, '~'))),
       h('span', { class: 'age', title: p.lastActivity ? new Date(p.lastActivity).toLocaleString('fr-FR') : '' }, ago(p.lastActivity)),
       // La croix met le projet au repos : ses agents sont arrêtés et il descend en bas de la liste
-      h('button', { class: 'x', title: p.parked ? 'Sortir du repos' : 'Mettre au repos : arrête les agents et range le projet en bas', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '×'));
+      h('button', { class: 'x', title: p.parked ? 'Remettre dans la liste' : 'Retirer de la liste : arrête ses agents (retrouvable via la recherche)', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '×'));
   };
   if (active.length) { list.append(h('li', { class: 'sep' }, 'Actifs')); active.forEach((p) => list.append(row(p))); }
   if (recent.length) { list.append(h('li', { class: 'sep' }, 'Récents')); recent.forEach((p) => list.append(row(p))); }
-  if (old.length) {
-    list.append(h('li', { class: 'sep toggle', onclick: () => { S.showOld = !S.showOld; store.set('showOld', S.showOld); renderProjects(); } },
-      `${showOld ? '▾' : '▸'} Anciens · ${old.length}`));
-    if (showOld) old.forEach((p) => list.append(row(p)));
-  }
-  if (parked.length) {
-    const showParked = filter || S.showParked;
-    list.append(h('li', { class: 'sep toggle', onclick: () => { S.showParked = !S.showParked; store.set('showParked', S.showParked); renderProjects(); } },
-      `${showParked ? '▾' : '▸'} Au repos · ${parked.length}`));
-    if (showParked) parked.forEach((p) => list.append(row(p)));
-  }
+  if (hidden.length) { list.append(h('li', { class: 'sep' }, 'Anciens / au repos')); hidden.forEach((p) => list.append(row(p))); }
   let waiting = 0;
   for (const p of S.projects) for (let i = 0; i < S.cfg.slots; i++) if (needsYou(slotState(p.id, i))) waiting++;
   document.title = (waiting ? `(${waiting}) ` : '') + 'Agent Deck';
@@ -133,10 +121,10 @@ async function loadProjects(refresh) {
 
 async function parkProject(p, parked) {
   const running = S.status[p.id] ? Object.keys(S.status[p.id]).length : 0;
-  if (parked && running && !confirm(`Mettre « ${p.name} » au repos ?\n${running} agent${running > 1 ? 's' : ''} en cours ser${running > 1 ? 'ont' : 'a'} arrêté${running > 1 ? 's' : ''}.`)) return;
+  if (parked && running && !confirm(`Retirer « ${p.name} » de la liste ?\n${running} agent${running > 1 ? 's' : ''} en cours ser${running > 1 ? 'ont' : 'a'} arrêté${running > 1 ? 's' : ''}.`)) return;
   await api(`${P(p.id)}/park`, { method: 'POST', body: { parked } });
   await Promise.all([loadProjects(), pollStatus()]);
-  toast(parked ? `${p.name} au repos` : `${p.name} de retour`);
+  toast(parked ? `${p.name} retiré de la liste` : `${p.name} de retour`);
 }
 
 async function hideProject(p) {
