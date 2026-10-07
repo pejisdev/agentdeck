@@ -45,10 +45,11 @@ const DEFAULT_CONFIG = {
   // Comptes Claude : « default » = ~/.claude ; les autres ont leur propre dossier (CLAUDE_CONFIG_DIR) sous ~/.claude-accounts
   accounts: [{ key: 'default', label: 'Principal' }],
   projectAccounts: {}, // chemin du projet -> clé du compte à utiliser
+  // Tous les agents démarrent SANS demande de permission (--dangerously-skip-permissions), c'est le défaut voulu.
+  // commandOf() ajoute le drapeau même si une vieille config.json ne l'a pas.
   commands: [
-    { key: 'claude', label: 'Claude', cmd: 'claude --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
-    { key: 'continue', label: 'Reprendre', cmd: 'claude --continue --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
-    { key: 'yolo', label: 'Sans permissions', cmd: 'claude --dangerously-skip-permissions --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
+    { key: 'claude', label: 'Claude', cmd: 'claude --dangerously-skip-permissions --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
+    { key: 'continue', label: 'Reprendre', cmd: 'claude --dangerously-skip-permissions --continue --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
     { key: 'shell', label: 'Shell', cmd: '' },
   ],
 };
@@ -373,7 +374,10 @@ function currentSessionId(name, rec) {
   try { const v = fs.readFileSync(path.join(SESS_DIR, name), 'utf8').trim(); if (/^[0-9a-f-]{36}$/.test(v)) return v; } catch {}
   return rec && rec.sessionId;
 }
-const commandOf = (key) => (config.commands.find((x) => x.key === key) || config.commands[0]).cmd;
+const SKIP_PERMS = '--dangerously-skip-permissions';
+// Toute commande `claude` lancée par le cockpit tourne en bypass permissions, quoi que dise config.json
+const withSkipPerms = (cmd) => (/^claude\b/.test(cmd) && !cmd.includes(SKIP_PERMS) ? cmd.replace(/^claude\b/, 'claude ' + SKIP_PERMS) : cmd);
+const commandOf = (key) => withSkipPerms((config.commands.find((x) => x.key === key) || config.commands[0]).cmd);
 const baseCmd = (key) => commandOf(key).replace(/\s--continue\b/, '');
 // --resume échoue si la conversation n'a jamais reçu de message (pas de transcript) : on la recrée avec le même ID
 const hasTranscript = (project, sid) => fs.existsSync(path.join(HOME, '.claude/projects', project.replace(/[^A-Za-z0-9]/g, '-'), sid + '.jsonl'));
