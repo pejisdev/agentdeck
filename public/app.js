@@ -245,7 +245,10 @@ class Pane {
       // Shift+Entrée : nouvelle ligne dans Claude Code. xterm.js enverrait un simple CR (indistinguable d'Entrée),
       // on envoie ESC+CR (Meta+Entrée), ce que /terminal-setup configure aussi dans iTerm2/VS Code.
       if (e.type === 'keydown' && e.shiftKey && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.metaKey) { this.send({ t: 'i', d: '\x1b\r' }); return false; }
-      // Ctrl+Shift+C / V : copier-coller
+      // Ctrl+V : xterm.js enverrait ^V au pty (et bloquerait le collage natif) ; on laisse le navigateur coller,
+      // ce qui déclenche l'événement paste (texte → xterm, image → pasteImage)
+      if (e.type === 'keydown' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'v') return false;
+      // Ctrl+Shift+C : copier (Ctrl+Shift+V colle déjà nativement)
       if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') { navigator.clipboard.writeText(term.getSelection()); return false; }
       return true;
     });
