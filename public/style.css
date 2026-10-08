@@ -78,6 +78,10 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 #projList .sep { padding: 10px 8px 4px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); cursor: default; }
 #projList .sep:hover { background: none; }
 #projList .sep.toggle:hover { color: var(--muted); }
+#projList li.scratch { margin-bottom: 4px; border-bottom: 1px solid var(--line); border-radius: 6px 6px 0 0; }
+#projList li.scratch .pname b { color: var(--accent); }
+#projList li .x.plus { visibility: visible; font-size: 15px; line-height: 1; }
+#projList li .x.plus:hover { color: var(--accent); }
 #projList li .age { font-size: 10.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }
 #projList li:hover .age { display: none; }
 .dots { display: grid; grid-template-columns: repeat(2, 6px); gap: 3px; }
@@ -100,8 +104,11 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 #repoGh { display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid var(--line); }
 .repo-row { display: flex; align-items: center; gap: 8px; padding: 8px 12px; margin: 0; }
 .repo-row .filter { flex: 1; margin: 0; }
+.repo-row select.small { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px; }
 #repoFilter { margin: 0 12px 6px; }
-#repoList { list-style: none; margin: 0; padding: 0 6px 6px; overflow-y: auto; max-height: 46vh; min-height: 0; }
+/* hauteur fixe : la liste arrive après l'ouverture, elle ne doit pas décaler les formulaires du bas pendant le chargement */
+#repoList { list-style: none; margin: 0; padding: 0 6px 6px; overflow-y: auto; height: 46vh; min-height: 0; }
+#repoGh.off #repoList { height: auto; }
 #repoList li { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
 #repoList li:hover { background: var(--panel-2); }
 #repoList li.cloned { opacity: .5; cursor: default; }
@@ -140,7 +147,8 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 .placeholder .acc-pick { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--faint); }
 #loginModal { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 55; display: grid; place-items: center; }
 .login-box { width: min(820px, 94vw); height: min(520px, 86vh); display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: 0 24px 60px rgba(0, 0, 0, .55); overflow: hidden; }
-.login-box p { margin: 0; padding: 8px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
+.login-box p { margin: 0; padding: 8px 12px 4px; font-size: 12px; }
+#loginCodeForm { border-bottom: 1px solid var(--line); padding-top: 4px; }
 #loginTerm { flex: 1; min-height: 0; background: #0d0e11; padding: 6px 0 0 8px; }
 .ubar { display: grid; grid-template-columns: 1fr auto auto; gap: 0 8px; align-items: baseline; margin-top: 3px; cursor: default; }
 .ubar .ul { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -160,21 +168,26 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 /* ---------- contrôle vocal ---------- */
 #micBtn.listening { color: var(--red); animation: pulse 1s infinite; }
 #micBtn.thinking { color: var(--accent); }
-#voiceBar { border-bottom: 1px solid var(--line); background: var(--panel); flex-shrink: 0; }
-#voiceForm { display: flex; align-items: center; gap: 8px; padding: 6px 10px; margin: 0; }
+/* Panneau flottant en bas à droite, par-dessus les terminaux : ne prend aucune place dans la grille */
+#center { position: relative; }
+#voiceBar { position: absolute; right: 14px; bottom: 14px; width: min(480px, calc(100% - 28px)); z-index: 20; background: rgba(18, 20, 25, .94); backdrop-filter: blur(8px); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: 0 16px 48px rgba(0, 0, 0, .55); overflow: hidden; }
+#voiceForm { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin: 0; }
 #voiceForm .vs { width: 10px; height: 10px; border-radius: 50%; background: #2a2f38; flex-shrink: 0; }
 #voiceForm .vs.listening { background: var(--red); animation: pulse 1s infinite; }
 #voiceForm .vs.thinking { background: var(--accent); animation: pulse .6s infinite; }
 #voiceForm .vs.speaking { background: var(--blue); }
 #voiceInput { flex: 1; padding: 6px 9px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; outline: none; }
 #voiceInput:focus { border-color: var(--line-2); }
-#voiceFeed { list-style: none; margin: 0; padding: 0 10px 6px; max-height: 160px; overflow-y: auto; font-size: 12px; }
+#voiceFeed { list-style: none; margin: 0; padding: 8px 12px 0; max-height: 92px; overflow-y: auto; font-size: 12px; }
+#voiceBar.expanded #voiceFeed { max-height: 50vh; }
+#voiceFeed:empty { display: none; }
 #voiceFeed li { display: flex; gap: 8px; padding: 2px 0; }
 #voiceFeed li .who { font-family: var(--mono); font-size: 10.5px; color: var(--faint); white-space: nowrap; min-width: 48px; padding-top: 2px; }
 #voiceFeed li.me .txt { color: var(--muted); }
 #voiceFeed li.bot .txt { color: var(--text); }
 #voiceFeed li.agent .txt { color: #a9c7ea; }
-#voiceFeed li .txt { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+#voiceFeed li .txt { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+#voiceBar.expanded #voiceFeed li .txt { -webkit-line-clamp: unset; }
 #voiceFeed li .txt a { color: var(--blue); cursor: pointer; text-decoration: none; }
 
 /* ---------- centre : grilles d'agents ---------- */
@@ -188,6 +201,7 @@ body.dragging iframe, body.dragging .xterm { pointer-events: none; }
 .deck.has-max .pane:not(.max) { display: none; }
 .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .pane.focused { border-color: #3b4250; }
+.pane.drop, #tree.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
 .pane.st-busy { border-color: rgba(217, 119, 87, .55); }
 .pane-head { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 6px 0 10px; border-bottom: 1px solid var(--line); background: var(--panel-2); flex-shrink: 0; user-select: none; }
 .pane-head .num { font-family: var(--mono); font-size: 11px; color: var(--faint); }

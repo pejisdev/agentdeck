@@ -80,4 +80,5 @@ Il n'écoute qu'en local. Pour y accéder :
   • ou un reverse proxy / tunnel Cloudflare en HTTPS devant 127.0.0.1:$PORT
 
 Dans l'interface : « Comptes Claude » → Se connecter, puis « + Ajouter un projet » → Connecter GitHub → clique sur tes dépôts.
+Contrôle vocal (micro 🎙) : mets OPENAI_API_KEY=sk-... dans $DIR/data/secrets.env (transcription gpt-4o-transcribe).
 MSG
