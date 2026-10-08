@@ -1,8 +1,16 @@
 {
   "name": "agentdeck",
   "version": "0.1.0",
-  "private": true,
-  "description": "Cockpit web pour piloter plusieurs Claude Code par projet sur un VPS",
+  "description": "Self-hosted web cockpit to run several Claude Code agents per project on a VPS",
+  "license": "MIT",
+  "author": "pejisdev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pejisdev/agentdeck.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

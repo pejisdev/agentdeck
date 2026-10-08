@@ -88,11 +88,12 @@ function renderProjects() {
   list.textContent = '';
   const items = S.projects.filter((p) => !filter || p.name.toLowerCase().includes(filter) || p.path.toLowerCase().includes(filter));
   const staleBefore = S.now - S.cfg.staleDays * 86400000;
-  const active = items.filter((p) => S.status[p.id]);
-  const recent = items.filter((p) => !S.status[p.id] && !p.parked && p.lastActivity >= staleBefore);
-  // Anciens et « au repos » ne s'affichent plus : la liste ne montre que l'actif et le récent.
-  // Ils restent trouvables en tapant leur nom dans le champ de recherche (⤒ pour sortir un projet du repos).
-  const hidden = filter ? items.filter((p) => !S.status[p.id] && (p.parked || p.lastActivity < staleBefore)) : [];
+  const scratch = items.find((p) => p.scratch);
+  const active = items.filter((p) => !p.scratch && S.status[p.id]);
+  const recent = items.filter((p) => !p.scratch && !S.status[p.id] && p.lastActivity >= staleBefore);
+  // Les anciens ne s'affichent plus : la liste ne montre que l'actif et le récent.
+  // Ils restent trouvables en tapant leur nom dans le champ de recherche.
+  const hidden = filter ? items.filter((p) => !p.scratch && !S.status[p.id] && p.lastActivity < staleBefore) : [];
   const row = (p) => {
     const dots = h('div', { class: 'dots' });
     for (let i = 0; i < S.cfg.slots; i++) dots.append(h('i', { class: 'dot ' + slotState(p.id, i) }));
@@ -101,11 +102,19 @@ function renderProjects() {
       title: p.path,
       onclick: () => selectProject(p.id),
     }, dots,
-      h('div', { class: 'pname' }, h('b', {}, p.name, p.account && p.account !== 'default' ? h('span', { class: 'acct-tag', title: 'Compte Claude : ' + accountLabel(p.account) }, accountLabel(p.account)) : null), h('small', {}, p.path.replace(/^\/home\/[^/]+/, '~'))),
+      h('div', { class: 'pname' }, h('b', {}, p.name, p.account && p.account !== 'default' ? h('span', { class: 'acct-tag', title: 'Compte Claude : ' + accountLabel(p.account) }, accountLabel(p.account)) : null), h('small', {}, p.missing ? '⚠ dossier supprimé — ferme ses agents' : p.path.replace(/^\/home\/[^/]+/, '~'))),
       h('span', { class: 'age', title: p.lastActivity ? new Date(p.lastActivity).toLocaleString('fr-FR') : '' }, ago(p.lastActivity)),
-      // La croix met le projet au repos : ses agents sont arrêtés et il descend en bas de la liste
-      h('button', { class: 'x', title: p.parked ? 'Remettre dans la liste' : 'Retirer de la liste : arrête ses agents (retrouvable via la recherche)', onclick: (e) => { e.stopPropagation(); parkProject(p, !p.parked); } }, p.parked ? '⤒' : '×'));
+      // La croix arrête les agents du projet, rien d'autre : il retombe dans « Récents »
+      S.status[p.id] ? h('button', { class: 'x', title: 'Arrêter les agents de ce projet', onclick: (e) => { e.stopPropagation(); stopProjectAgents(p); } }, '×') : null);
   };
+  // Agent libre : toujours en tête, pas de croix, un + pour lancer un agent tout de suite
+  if (scratch) {
+    const dots = h('div', { class: 'dots' });
+    for (let i = 0; i < S.cfg.slots; i++) dots.append(h('i', { class: 'dot ' + slotState(scratch.id, i) }));
+    list.append(h('li', { class: 'scratch ' + (scratch.id === S.current ? 'active ' : '') + (S.done.has(scratch.id) ? 'done' : ''), title: 'Agents temporaires pour des demandes générales, hors projet', onclick: () => selectProject(scratch.id) },
+      dots, h('div', { class: 'pname' }, h('b', {}, '⚡ Agent libre'), h('small', {}, 'demandes générales, hors projet')),
+      h('button', { class: 'x plus', title: 'Lancer un agent libre', onclick: (e) => { e.stopPropagation(); startFreeAgent(scratch); } }, '+')));
+  }
   if (active.length) { list.append(h('li', { class: 'sep' }, 'Actifs')); active.forEach((p) => list.append(row(p))); }
   if (recent.length) { list.append(h('li', { class: 'sep' }, 'Récents')); recent.forEach((p) => list.append(row(p))); }
   if (hidden.length) { list.append(h('li', { class: 'sep' }, 'Anciens / au repos')); hidden.forEach((p) => list.append(row(p))); }
@@ -114,17 +123,28 @@ function renderProjects() {
   document.title = (waiting ? `(${waiting}) ` : '') + 'Agent Deck';
 }
 
+// Lance un Claude dans le premier emplacement libre de l'agent libre
+async function startFreeAgent(p) {
+  await selectProject(p.id);
+  const d = S.decks.get(p.id);
+  const pane = d && d.panes.find((pn, i) => !pn.term && !(S.status[p.id] && S.status[p.id][i]));
+  if (!pane) return toast('Les 4 agents libres sont déjà pris', true);
+  pane.start('claude');
+}
+
 async function loadProjects(refresh) {
   S.projects = await api('/api/projects' + (refresh ? '?refresh=1' : ''));
   renderProjects();
 }
 
-async function parkProject(p, parked) {
+async function stopProjectAgents(p) {
   const running = S.status[p.id] ? Object.keys(S.status[p.id]).length : 0;
-  if (parked && running && !confirm(`Retirer « ${p.name} » de la liste ?\n${running} agent${running > 1 ? 's' : ''} en cours ser${running > 1 ? 'ont' : 'a'} arrêté${running > 1 ? 's' : ''}.`)) return;
-  await api(`${P(p.id)}/park`, { method: 'POST', body: { parked } });
+  if (!running) return;
+  if (!confirm(`Arrêter ${running > 1 ? `les ${running} agents` : "l'agent"} de « ${p.name} » ?`)) return;
+  try { await api(`${P(p.id)}/stop`, { method: 'POST' }); } catch (e) { return toast(e.message, true); }
+  const d = S.decks.get(p.id); if (d) d.panes.forEach((pn) => pn.teardown());
   await Promise.all([loadProjects(), pollStatus()]);
-  toast(parked ? `${p.name} retiré de la liste` : `${p.name} de retour`);
+  toast(`Agents de ${p.name} arrêtés`);
 }
 
 async function hideProject(p) {
@@ -149,6 +169,8 @@ async function refreshRepoStatus() {
   else st.textContent = `GitHub : ${repoStatus.user}`;
   $('#repoGhLogin').hidden = !repoStatus.installed || repoStatus.loggedIn;
   $('#repoGhRefresh').hidden = $('#repoFilter').hidden = !repoStatus.loggedIn;
+  $('#repoNewGh').hidden = !repoStatus.loggedIn; if (!repoStatus.loggedIn) $('#repoNewGh').value = '';
+  $('#repoGh').classList.toggle('off', !repoStatus.loggedIn);
   if (repoStatus.loggedIn) loadRepos(); else { repos = []; renderRepos(); }
 }
 async function loadRepos(refresh) {
@@ -183,6 +205,19 @@ $('#repoFilter').addEventListener('input', renderRepos);
 $('#repoGhRefresh').addEventListener('click', () => loadRepos(true));
 $('#repoGhLogin').addEventListener('click', () => openLogin({ key: 'gh', label: 'github.com' }));
 $('#repoUrlForm').addEventListener('submit', (e) => { e.preventDefault(); const v = $('#repoUrl').value.trim(); if (v) { cloneRepo(v); $('#repoUrl').value = ''; } });
+$('#repoNewForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('#repoNew').value.trim(); if (!name) return;
+  const github = $('#repoNewGh').value || null;
+  const btn = $('#repoNewForm button'); btn.disabled = true; btn.textContent = 'Création…';
+  toast(`Création de ${name}…`);
+  try {
+    const p = await api('/api/repos/new', { method: 'POST', body: { name, github } });
+    toast(p.warning ? `${p.name} créé en local, mais ${p.warning}` : `${p.name} créé${github ? ' et poussé sur GitHub' : ''}`, !!p.warning);
+    closeRepoModal(); $('#repoNew').value = ''; await loadProjects(true); selectProject(p.id);
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; btn.textContent = 'Créer'; }
+});
 $('#repoPathForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const path = $('#repoPath').value.trim(); if (!path) return;
@@ -257,16 +292,20 @@ class Pane {
     this.teardown(); pollStatus();
   }
 
-  async pasteImage(file) {
-    if (!file || !this.ws || this.ws.readyState !== WebSocket.OPEN) return toast('Terminal non connecté', true);
-    toast(`Envoi de l'image (${(file.size / 1024).toFixed(0)} Ko)…`);
-    try {
-      const r = await fetch(`${P(this.deck.id)}/paste`, { method: 'POST', headers: { 'content-type': file.type }, body: file });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || r.statusText);
-      this.send({ t: 'i', d: j.path + ' ' });
-      this.term && this.term.focus();
-    } catch (e) { toast('Collage impossible : ' + e.message, true); }
+  async pasteFiles(files) {
+    if (!files.length) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return toast('Terminal non connecté', true);
+    for (const file of files) {
+      toast(`Envoi de ${file.name || 'l\'image'} (${fmtSize(file.size)})…`);
+      try {
+        // Corps en binaire brut : avec le vrai type (ex. application/json) le parseur JSON global d'Express l'avalerait avant nous
+        const r = await fetch(`${P(this.deck.id)}/paste?${q({ name: file.name || '', type: file.type || '' })}`, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || r.statusText);
+        this.send({ t: 'i', d: j.path + ' ' });
+      } catch (e) { toast('Envoi impossible : ' + e.message, true); }
+    }
+    this.term && this.term.focus();
   }
 
   toggleMax() {
@@ -300,24 +339,30 @@ class Pane {
       if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && ['p', 'b'].includes(e.key.toLowerCase()) && !e.shiftKey) return false;
       if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.code === 'Space') return false;
       if (e.type === 'keydown' && e.altKey && /^[1-4]$/.test(e.key)) return false;
-      // Shift+Entrée : nouvelle ligne dans Claude Code. xterm.js enverrait un simple CR (indistinguable d'Entrée),
-      // on envoie ESC+CR (Meta+Entrée), ce que /terminal-setup configure aussi dans iTerm2/VS Code.
-      if (e.type === 'keydown' && e.shiftKey && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.metaKey) { this.send({ t: 'i', d: '\x1b\r' }); return false; }
+      // Shift+Entrée : nouvelle ligne dans Claude Code. xterm.js enverrait un simple CR (indistinguable d'Entrée).
+      // On envoie la touche encodée « CSI 13;2u » (protocole kitty, Shift+Entrée sans ambiguïté), que tmux
+      // (extended-keys on) transmet à Claude. ESC+CR, l'ancien choix, pouvait être lu comme Échap puis Entrée.
+      // On bloque aussi keypress/keyup : sinon xterm envoie encore un CR nu sur le keypress, et le message part.
+      if (e.shiftKey && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.metaKey) { if (e.type === 'keydown') this.send({ t: 'i', d: '\x1b[13;2u' }); return false; }
       // Ctrl+V : xterm.js enverrait ^V au pty (et bloquerait le collage natif) ; on laisse le navigateur coller,
-      // ce qui déclenche l'événement paste (texte → xterm, image → pasteImage)
+      // ce qui déclenche l'événement paste (texte → xterm, fichier → pasteFiles)
       if (e.type === 'keydown' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'v') return false;
       // Ctrl+Shift+C : copier (Ctrl+Shift+V colle déjà nativement)
       if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') { navigator.clipboard.writeText(term.getSelection()); return false; }
       return true;
     });
-    // Collage d'image : Claude Code ne voit pas le presse-papiers du navigateur, on envoie l'image au serveur
-    // puis on tape le chemin du fichier dans le terminal (Claude la lit comme un fichier image).
+    // Collage de fichier (image, PDF, n'importe quoi) : Claude Code ne voit pas le presse-papiers du navigateur, on
+    // envoie le fichier au serveur puis on tape son chemin dans le terminal (Claude le lit comme un fichier).
     holder.addEventListener('paste', (e) => {
-      const item = [...(e.clipboardData && e.clipboardData.items || [])].find((it) => it.kind === 'file' && /^image\/(png|jpeg|gif|webp)$/.test(it.type));
-      if (!item) return; // texte : xterm gère
+      const items = [...(e.clipboardData && e.clipboardData.items || [])].filter((it) => it.kind === 'file');
+      if (!items.length) return; // texte : xterm gère
       e.preventDefault(); e.stopPropagation();
-      this.pasteImage(item.getAsFile());
+      this.pasteFiles(items.map((it) => it.getAsFile()).filter(Boolean));
     }, true);
+    // Glisser-déposer de fichiers sur le terminal : même chose
+    this.el.addEventListener('dragover', (e) => { if (hasFiles(e)) { e.preventDefault(); this.el.classList.add('drop'); } });
+    this.el.addEventListener('dragleave', () => this.el.classList.remove('drop'));
+    this.el.addEventListener('drop', (e) => { this.el.classList.remove('drop'); if (!hasFiles(e)) return; e.preventDefault(); this.pasteFiles([...e.dataTransfer.files]); });
     term.textarea && term.textarea.addEventListener('focus', () => this.setFocus());
     this.term = term;
     document.fonts && document.fonts.ready.then(() => this.scheduleFit());
@@ -477,10 +522,12 @@ function renderAccounts() {
         h('span', { class: 'plan' }, planName(a)),
         h('span', { class: 'spacer' }),
         h('span', { class: 'cnt', title: `${a.projects} projet(s) · ${a.agents} agent(s) en cours` }, `${a.projects}p · ${a.agents}a`),
-        a.loggedIn ? h('button', { class: 'x', title: 'Reconnecter (changer de compte)', onclick: () => openLogin(a) }, '↻') : null,
+        a.loggedIn ? h('button', { class: 'x', title: 'Actualiser l\'usage', onclick: () => pollUsage(true) }, '↻') : null,
+        a.loggedIn ? h('button', { class: 'x', title: 'Changer de compte : déconnecte ce compte sur le VPS puis relance la connexion', onclick: () => switchAccount(a) }, '⇄') : null,
         a.isDefault ? null : h('button', { class: 'x', title: 'Retirer ce compte', onclick: () => removeAccount(a) }, '×')),
       a.email ? h('small', { class: 'email', title: a.org || '' }, a.email) : null);
     if (!a.loggedIn) el.append(h('button', { class: 'connect', onclick: () => openLogin(a) }, a.loginOpen ? 'Connexion en cours…' : 'Se connecter'));
+    else if (a.loginOpen) el.append(h('button', { class: 'connect', title: 'Une fenêtre de connexion attend encore un code', onclick: () => openLogin(a) }, 'Connexion en cours…'));
     else {
       el.append(usageBars(u));
       if (u.error) el.append(h('div', { class: 'note' }, '⚠ ' + u.error + (u.stale ? ' (dernière valeur connue)' : '')));
@@ -516,11 +563,11 @@ $('#switchOn').addEventListener('change', saveSwitch);
 $('#switchThr').addEventListener('change', saveSwitch);
 
 let usageTimer;
-async function pollUsage() {
+async function pollUsage(refresh) {
   clearTimeout(usageTimer);
   usageTimer = setTimeout(pollUsage, 60000);
   let r;
-  try { r = await api('/api/accounts'); } catch { return; }
+  try { r = await api('/api/accounts' + (refresh === true ? '?refresh=1' : '')); } catch { return; }
   S.now = r.now; S.accounts = r.accounts;
   if (S.cfg) S.cfg.accounts = r.accounts.map(({ key, label }) => ({ key, label }));
   renderAccounts(); renderSwitch();
@@ -545,6 +592,10 @@ $('#addAccount').addEventListener('click', async () => {
   catch (e) { toast(e.message, true); }
 });
 
+async function switchAccount(a) {
+  if (!confirm(`Changer de compte pour « ${a.label} » ?\nLe compte actuel (${a.email || 'connecté'}) sera déconnecté sur le VPS, puis une fenêtre de connexion s'ouvrira. Les agents déjà lancés continuent.`)) return;
+  openLogin(a);
+}
 async function removeAccount(a) {
   if (!confirm(`Retirer le compte « ${a.label} » ?\nSes identifiants seront supprimés du VPS ; les projets qui l'utilisaient repassent sur le compte principal.`)) return;
   try { await api(`/api/accounts/${a.key}`, { method: 'DELETE' }); await loadProjects(); await pollUsage(); }
@@ -562,7 +613,9 @@ function closeLogin() {
 }
 async function openLogin(a) {
   const gh = a.key === 'gh';
+  loginKey = a.key;
   $('#loginAccountName').textContent = a.label;
+  $('#loginCode').value = '';
   $('#loginModal .title').textContent = gh ? 'Connexion GitHub' : 'Connexion Claude';
   $('#loginModal p').textContent = gh ? 'Note le code affiché, ouvre le lien github.com/login/device dans ton navigateur et saisis-le. Appuie sur Entrée ici quand c\'est demandé.'
     : 'Ouvre le lien affiché dans ton navigateur, connecte-toi avec le compte voulu, puis colle le code ici.';
@@ -588,6 +641,19 @@ async function openLogin(a) {
   term.focus();
 }
 $('#loginClose').addEventListener('click', closeLogin);
+let loginKey = null;
+$('#loginCancel').addEventListener('click', async () => {
+  if (loginKey) { try { await api(`/api/accounts/${loginKey}/login`, { method: 'DELETE' }); toast('Connexion annulée'); } catch (e) { toast(e.message, true); } }
+  closeLogin();
+});
+// Le collage dans le terminal peut échouer selon le navigateur : ce champ envoie le code (et Entrée) à la session
+$('#loginCodeForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const code = $('#loginCode').value.trim(); if (!code) return;
+  if (!loginWs || loginWs.readyState !== 1) return toast('Fenêtre de connexion non attachée', true);
+  loginWs.send(JSON.stringify({ t: 'i', d: code + '\r' }));
+  $('#loginCode').value = ''; if (loginTerm) loginTerm.focus();
+});
 $('#loginModal').addEventListener('mousedown', (e) => { if (e.target.id === 'loginModal') closeLogin(); });
 
 // ---------------------------------------------------------------- contrôle vocal
@@ -598,12 +664,16 @@ const Voice = {
   get lang() { return (S.cfg && S.cfg.voice && S.cfg.voice.lang) || 'fr-FR'; },
   get canSpeak() { return 'speechSynthesis' in window && !(S.cfg && S.cfg.voice && S.cfg.voice.speak === false); },
 };
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-function voiceOpen() { $('#voiceBar').hidden = false; $('#voiceInput').focus(); S.decks.forEach((d) => d.panes.forEach((p) => p.scheduleFit())); }
-function voiceClose() { voiceStop(); $('#voiceBar').hidden = true; S.decks.forEach((d) => d.panes.forEach((p) => p.scheduleFit())); }
+// Enregistrement micro (MediaRecorder) → /api/voice/transcribe (gpt-4o-transcribe côté serveur, prompt = noms des
+// projets). Arrêt automatique après ~1,4 s de silence une fois qu'on a parlé, ou au second clic, 30 s max.
+const REC_MIME = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'].find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+function voiceOpen() { $('#voiceBar').hidden = false; $('#voiceInput').focus(); }
+function voiceClose() { voiceStop(true); if (Voice.audio) { Voice.audio.pause(); Voice.audio = null; } $('#voiceBar').hidden = true; }
+$('#voiceFeedToggle').addEventListener('click', () => { const on = $('#voiceBar').classList.toggle('expanded'); $('#voiceFeedToggle').textContent = on ? '▾' : '▴'; });
 function voiceSetState(st) {
   $('#voiceState').className = 'vs ' + (st || '');
   $('#micBtn').className = 'ghost icon ' + (st === 'listening' || st === 'thinking' ? st : '');
+  $('#voiceInput').placeholder = st === 'listening' ? 'Je t\'écoute… (clic sur le micro ou Ctrl+Shift+Espace pour envoyer)' : st === 'thinking' ? 'Transcription…' : 'Parle, ou tape une consigne : « dis à cabal de lancer les tests »…';
 }
 function voiceLog(who, text, cls, link) {
   const ul = $('#voiceFeed');
@@ -613,10 +683,10 @@ function voiceLog(who, text, cls, link) {
   while (ul.children.length > 30) ul.firstChild.remove();
   ul.scrollTop = ul.scrollHeight;
 }
-function speak(text) {
-  if (!Voice.canSpeak || !text) return;
-  const clean = String(text).replace(/[`*_#>]+/g, '').replace(/\[(.*?)\]\(.*?\)/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 400);
-  if (!clean) return;
+// Voix : TTS serveur (OpenAI, style Jarvis) joué en mp3 ; la voix système du navigateur ne sert que de secours
+let speakSeq = 0;
+function speakFallback(clean) {
+  if (!('speechSynthesis' in window)) return;
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(clean);
   u.lang = Voice.lang;
@@ -625,30 +695,80 @@ function speak(text) {
   u.onstart = () => voiceSetState('speaking'); u.onend = () => voiceSetState(Voice.listening ? 'listening' : '');
   speechSynthesis.speak(u);
 }
-function voiceStart() {
-  if (!SR) { voiceOpen(); toast('Reconnaissance vocale indisponible dans ce navigateur (Chrome ou Edge) : tape ta consigne', true); return; }
-  if (Voice.listening) return voiceStop();
-  voiceOpen();
-  speechSynthesis && speechSynthesis.cancel();
-  const rec = new SR();
-  rec.lang = Voice.lang; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
-  let finalText = '';
-  rec.onresult = (e) => {
-    let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) { const t = e.results[i][0].transcript; if (e.results[i].isFinal) finalText += t; else interim += t; }
-    $('#voiceInput').value = (finalText + ' ' + interim).trim();
-  };
-  rec.onerror = (e) => { if (e.error !== 'aborted' && e.error !== 'no-speech') toast('Micro : ' + e.error, true); };
-  rec.onend = () => {
-    Voice.listening = false; Voice.rec = null; voiceSetState('');
-    const text = $('#voiceInput').value.trim();
-    if (finalText.trim() && text) voiceSend(text);
-  };
-  Voice.rec = rec; Voice.listening = true; voiceSetState('listening');
-  $('#voiceInput').value = '';
-  try { rec.start(); } catch (e) { Voice.listening = false; voiceSetState(''); toast('Micro : ' + e.message, true); }
+async function speak(text) {
+  if (!(S.cfg && S.cfg.voice && S.cfg.voice.speak !== false) || !text) return;
+  const clean = String(text).replace(/[`*_#>]+/g, '').replace(/\[(.*?)\]\(.*?\)/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 400);
+  if (!clean) return;
+  const seq = ++speakSeq;
+  if (Voice.audio) { Voice.audio.pause(); Voice.audio = null; }
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  if (!S.cfg.voice.tts) return speakFallback(clean);
+  try {
+    const r = await fetch('/api/voice/speak', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: clean }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const url = URL.createObjectURL(await r.blob());
+    if (seq !== speakSeq) return URL.revokeObjectURL(url);
+    const a = new Audio(url); Voice.audio = a;
+    a.onplay = () => voiceSetState('speaking');
+    a.onended = a.onerror = () => { URL.revokeObjectURL(url); if (Voice.audio === a) { Voice.audio = null; voiceSetState(Voice.listening ? 'listening' : ''); } };
+    await a.play();
+  } catch (e) { console.warn('TTS', e); speakFallback(clean); }
 }
-function voiceStop() { if (Voice.rec) { try { Voice.rec.abort(); } catch {} } Voice.listening = false; Voice.rec = null; voiceSetState(''); }
+async function voiceStart() {
+  if (Voice.listening) return voiceStop(); // second appui : on arrête et on envoie
+  voiceOpen();
+  if (!(S.cfg && S.cfg.voice && S.cfg.voice.stt)) return toast('Transcription non configurée sur le serveur (OPENAI_API_KEY dans data/secrets.env) : tape ta consigne', true);
+  if (!navigator.mediaDevices || !REC_MIME) return toast('Micro indisponible dans ce navigateur : tape ta consigne', true);
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } }); }
+  catch (e) { return toast('Micro refusé : ' + e.message, true); }
+  const rec = new MediaRecorder(stream, { mimeType: REC_MIME, audioBitsPerSecond: 48000 });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  // Détection de silence : RMS sur un AnalyserNode toutes les 100 ms
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream); const an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let spoke = false, silentSince = 0, noise = 0.004;
+  const startedAt = Date.now();
+  const tick = setInterval(() => {
+    an.getFloatTimeDomainData(buf);
+    let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const rms = Math.sqrt(sum / buf.length);
+    if (!spoke) noise = Math.max(0.002, noise * 0.9 + rms * 0.1); // bruit de fond estimé avant la parole
+    const thr = Math.max(0.012, noise * 3);
+    if (rms > thr) { spoke = true; silentSince = 0; }
+    else if (spoke) { silentSince ||= Date.now(); if (Date.now() - silentSince > 1400) voiceStop(); }
+    if (Date.now() - startedAt > 30000) voiceStop();
+    if (!spoke && Date.now() - startedAt > 8000) voiceStop(true); // rien dit : on abandonne
+  }, 100);
+  Voice.rec = rec; Voice.listening = true; Voice.cleanup = () => { clearInterval(tick); stream.getTracks().forEach((t) => t.stop()); ctx.close().catch(() => {}); };
+  Voice.onstop = async (cancel) => {
+    Voice.cleanup(); Voice.listening = false; Voice.rec = null;
+    if (cancel || !chunks.length) { voiceSetState(''); return; }
+    const blob = new Blob(chunks, { type: REC_MIME.split(';')[0] });
+    if (blob.size < 1500) { voiceSetState(''); return; }
+    voiceSetState('thinking');
+    try {
+      const r = await fetch('/api/voice/transcribe', { method: 'POST', headers: { 'content-type': blob.type }, body: blob });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      if (!j.text) { voiceSetState(''); return toast('Rien compris, réessaie'); }
+      $('#voiceInput').value = j.text;
+      voiceSend(j.text);
+    } catch (e) { voiceSetState(''); toast(e.message, true); }
+  };
+  rec.onstop = () => Voice.onstop(Voice.cancelled);
+  $('#voiceInput').value = '';
+  voiceSetState('listening');
+  rec.start(250);
+}
+function voiceStop(cancel) {
+  if (!Voice.rec) return;
+  Voice.cancelled = !!cancel;
+  try { Voice.rec.stop(); } catch { Voice.onstop && Voice.onstop(true); }
+}
 async function voiceSend(text) {
   if (Voice.busy || !text) return;
   Voice.busy = true; voiceSetState('thinking');
@@ -670,14 +790,18 @@ function voiceAgentDone(p, slot, st, message) {
   if (Voice.spoken.has(key)) return;
   Voice.spoken.add(key);
   const who = `${p.name} · agent ${slot + 1}`;
-  const text = st === 'perm' ? 'demande ton autorisation' : (message ? message.replace(/\s+/g, ' ').trim() : 'a terminé');
+  const full = message ? message.replace(/\s+/g, ' ').trim() : '';
   voiceOpen();
-  voiceLog(who, text, 'agent', { id: p.id, slot });
-  speak(`${p.name}, agent ${slot + 1} : ${text}`);
+  voiceLog(who, st === 'perm' ? 'demande ton autorisation' : (full || 'a terminé'), 'agent', { id: p.id, slot });
+  // À l'oreille : la cible et les deux premières phrases, sans dépasser ~220 caractères (le détail est dans le fil)
+  const sentences = full.replace(/[`*_#>]+/g, '').replace(/^[-•]\s*/gm, '').split(/(?<=[.!?])\s+/).filter(Boolean);
+  let brief = sentences.slice(0, 2).join(' ');
+  if (brief.length > 220) brief = brief.slice(0, 217).replace(/\s+\S*$/, '') + '…';
+  speak(st === 'perm' ? `${p.name}, agent ${slot + 1} demande ton autorisation.` : `${p.name}, agent ${slot + 1} a terminé.${brief ? ' ' + brief : ''}`);
 }
 $('#micBtn').addEventListener('click', voiceStart);
 $('#voiceClose').addEventListener('click', voiceClose);
-$('#voiceForm').addEventListener('submit', (e) => { e.preventDefault(); voiceStop(); voiceSend($('#voiceInput').value.trim()); });
+$('#voiceForm').addEventListener('submit', (e) => { e.preventDefault(); voiceStop(true); voiceSend($('#voiceInput').value.trim()); });
 if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
 // ---------------------------------------------------------------- sélection projet
@@ -806,6 +930,41 @@ async function showFiles(id) {
   showActive();
 }
 $('#refreshTree').addEventListener('click', () => refreshTree(FS(), true));
+
+// ---------------------------------------------------------------- upload de fichiers dans le projet
+const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+const fmtSize = (n) => n < 1024 ? n + ' o' : n < 1048576 ? (n / 1024).toFixed(0) + ' Ko' : (n / 1048576).toFixed(1) + ' Mo';
+// Dossier cible : le dossier sélectionné dans l'arbre, ou le dossier du fichier sélectionné, sinon la racine
+function uploadDir(fs) {
+  const sel = fs.selected || '';
+  if (!sel) return '';
+  const parent = sel.split('/').slice(0, -1).join('/');
+  const entry = (fs.listings.get(parent) || []).find((e) => e.name === sel.split('/').pop());
+  return entry && entry.dir ? sel : parent;
+}
+async function uploadFiles(files, dir) {
+  const fs = FS(); if (!fs || !files.length) return;
+  if (dir == null) dir = uploadDir(fs);
+  let ok = 0;
+  for (const file of files) {
+    const send = async (overwrite) => {
+      const r = await fetch(`${P(fs.id)}/upload?${q({ dir, name: file.name, overwrite: overwrite ? 1 : 0 })}`, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 409) { if (confirm(`${file.name} existe déjà dans ${dir || 'la racine'}. Remplacer ?`)) return send(true); return false; }
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      return true;
+    };
+    try { if (await send(false)) ok++; } catch (e) { toast(`${file.name} : ${e.message}`, true); }
+  }
+  if (ok) toast(`${ok} fichier${ok > 1 ? 's' : ''} envoyé${ok > 1 ? 's' : ''} dans ${dir || 'la racine'}`);
+  if (!fs.expanded.has(dir)) fs.expanded.add(dir);
+  await refreshTree(fs, true);
+}
+$('#uploadBtn').addEventListener('click', () => { if (FS()) $('#uploadInput').click(); });
+$('#uploadInput').addEventListener('change', async (e) => { await uploadFiles([...e.target.files]); e.target.value = ''; });
+$('#tree').addEventListener('dragover', (e) => { if (hasFiles(e) && FS()) { e.preventDefault(); $('#tree').classList.add('drop'); } });
+$('#tree').addEventListener('dragleave', () => $('#tree').classList.remove('drop'));
+$('#tree').addEventListener('drop', (e) => { $('#tree').classList.remove('drop'); if (!hasFiles(e)) return; e.preventDefault(); uploadFiles([...e.dataTransfer.files]); });
 
 // ---------------------------------------------------------------- éditeur (Monaco)
 let monacoReady, editor, diffEditor, diffMode = false;

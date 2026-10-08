@@ -59,13 +59,13 @@
       <button id="toggleFiles" class="ghost icon" title="Afficher/masquer les fichiers (Ctrl+B)">◧</button>
     </header>
     <div id="voiceBar" hidden>
+      <ul id="voiceFeed"></ul>
       <form id="voiceForm">
         <span id="voiceState" class="vs"></span>
         <input id="voiceInput" placeholder="Parle, ou tape une consigne : « dis à cabal de lancer les tests »…" spellcheck="false" autocomplete="off">
-        <button class="ghost small">Envoyer</button>
+        <button type="button" id="voiceFeedToggle" class="ghost icon" title="Voir tout le fil">▴</button>
         <button type="button" id="voiceClose" class="ghost icon" title="Fermer">×</button>
       </form>
-      <ul id="voiceFeed"></ul>
     </div>
     <div id="decks"><div class="empty-state">Choisis un projet à gauche</div></div>
   </main>
@@ -77,6 +77,8 @@
       <span class="title">Fichiers</span>
       <span class="spacer"></span>
       <button id="quickOpenBtn" class="ghost" title="Ouverture rapide (Ctrl+P)">Ctrl+P</button>
+      <button id="uploadBtn" class="ghost icon" title="Envoyer des fichiers dans le dossier sélectionné (ou glisse-les sur l'arbre)">⬆</button>
+      <input id="uploadInput" type="file" multiple hidden>
       <button id="refreshTree" class="ghost icon" title="Rafraîchir">↻</button>
     </header>
     <div id="tree"></div>
@@ -127,6 +129,15 @@
       <input id="repoUrl" class="filter" placeholder="URL git (https://… ou git@…) ou owner/nom" spellcheck="false" autocomplete="off">
       <button class="ghost small">Cloner</button>
     </form>
+    <form id="repoNewForm" class="repo-row">
+      <input id="repoNew" class="filter" placeholder="Nouveau dépôt : nom du projet (ex : mon-app)" spellcheck="false" autocomplete="off">
+      <select id="repoNewGh" class="small" title="Créer aussi le dépôt sur GitHub">
+        <option value="private">GitHub privé</option>
+        <option value="public">GitHub public</option>
+        <option value="">Local seulement</option>
+      </select>
+      <button class="ghost small">Créer</button>
+    </form>
     <form id="repoPathForm" class="repo-row">
       <input id="repoPath" class="filter" placeholder="Dossier déjà présent sur le serveur (ex : ~/mon-projet)" spellcheck="false" autocomplete="off">
       <button class="ghost small">Ajouter</button>
@@ -140,9 +151,14 @@
       <span class="title">Connexion Claude</span>
       <span id="loginAccountName" class="muted"></span>
       <span class="spacer"></span>
-      <button id="loginClose" class="ghost icon" title="Fermer">×</button>
+      <button id="loginCancel" class="ghost small" title="Arrête la connexion en cours (la session de login est fermée)">Annuler</button>
+      <button id="loginClose" class="ghost icon" title="Fermer la fenêtre (la connexion reste en cours)">×</button>
     </header>
     <p class="muted">Ouvre le lien affiché dans ton navigateur, connecte-toi avec le compte voulu, puis colle le code ici.</p>
+    <form id="loginCodeForm" class="repo-row">
+      <input id="loginCode" class="filter" placeholder="Colle le code d'authentification ici puis Entrée" spellcheck="false" autocomplete="off">
+      <button class="ghost small">Envoyer</button>
+    </form>
     <div id="loginTerm"></div>
   </div>
 </div>

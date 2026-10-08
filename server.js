@@ -40,7 +40,13 @@ const DEFAULT_CONFIG = {
   // Bascule automatique : si le compte prévu dépasse ce % sur une de ses limites, les nouveaux agents prennent le compte suivant
   accountSwitch: { enabled: false, threshold: 80 },
   // Contrôle vocal : modèle du dispatcher (claude -p, sur ton abonnement) et langue de reconnaissance/synthèse
-  voice: { model: 'sonnet', lang: 'fr-FR', speak: true },
+  // stt : transcription côté serveur (OpenAI gpt-4o-transcribe, clé dans data/secrets.env ou l'environnement)
+  // tts : voix de synthèse côté serveur (OpenAI gpt-4o-mini-tts, même clé) ; voix : ash, onyx, echo, verse, sage, alloy…
+  voice: {
+    model: 'sonnet', lang: 'fr-FR', speak: true,
+    stt: { model: 'gpt-4o-transcribe' },
+    tts: { model: 'gpt-4o-mini-tts', voice: 'ash', instructions: "Tu es l'assistant vocal d'un cockpit d'agents, façon Jarvis : voix grave, calme et posée, parfaitement articulée, débit mesuré, ton sobre avec une pointe d'ironie britannique. Jamais enjoué ni commercial." },
+  },
   parked: [],    // projets envoyés « Au repos », tout en bas
   // Comptes Claude : « default » = ~/.claude ; les autres ont leur propre dossier (CLAUDE_CONFIG_DIR) sous ~/.claude-accounts
   accounts: [{ key: 'default', label: 'Principal' }],
@@ -48,8 +54,8 @@ const DEFAULT_CONFIG = {
   // Tous les agents démarrent SANS demande de permission (--dangerously-skip-permissions), c'est le défaut voulu.
   // commandOf() ajoute le drapeau même si une vieille config.json ne l'a pas.
   commands: [
-    { key: 'claude', label: 'Claude', cmd: 'claude --dangerously-skip-permissions --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
-    { key: 'continue', label: 'Reprendre', cmd: 'claude --dangerously-skip-permissions --continue --append-system-prompt-file ~/agentdeck/agent-prompt.md' },
+    { key: 'claude', label: 'Claude', cmd: `claude --dangerously-skip-permissions --append-system-prompt-file ${path.join(__dirname, 'agent-prompt.md')}` },
+    { key: 'continue', label: 'Reprendre', cmd: `claude --dangerously-skip-permissions --continue --append-system-prompt-file ${path.join(__dirname, 'agent-prompt.md')}` },
     { key: 'shell', label: 'Shell', cmd: '' },
   ],
 };
@@ -69,6 +75,7 @@ const ACCOUNTS_DIR = path.join(HOME, '.claude-accounts');
 const SHARED_ITEMS = ['settings.json', 'skills', 'plugins', 'commands', 'agents', 'projects', 'plans', 'CLAUDE.md'];
 if (!Array.isArray(config.accounts) || !config.accounts.some((a) => a.key === 'default')) config.accounts = [{ key: 'default', label: 'Principal' }, ...(config.accounts || []).filter((a) => a.key !== 'default')];
 config.projectAccounts ||= {};
+config.parked = []; // 2026-10-08 : « au repos » abandonné, la croix ne fait qu'arrêter les agents
 const accountDir = (a) => (a.key === 'default' ? path.join(HOME, '.claude') : path.join(ACCOUNTS_DIR, a.key));
 const getAccount = (key) => config.accounts.find((a) => a.key === key) || config.accounts[0];
 const projectAccount = (projectPath) => getAccount(config.projectAccounts[projectPath] || 'default');
@@ -217,6 +224,15 @@ const isAuthed = (cookies) => safeEq(cookies && cookies.ad_token, TOKEN);
 const projId = (p) => crypto.createHash('sha1').update(p).digest('hex').slice(0, 10);
 const sessionName = (id, slot) => `ad_${id}_${slot}`;
 
+// « Agent libre » : un espace hors projet pour les demandes générales. Toujours en tête de liste, jamais au
+// repos, pas de reprise automatique (temporaire par nature : on lance, on demande, on arrête).
+const SCRATCH = path.join(HOME, '.agentdeck', 'libre');
+try {
+  fs.mkdirSync(SCRATCH, { recursive: true });
+  if (!fs.existsSync(path.join(SCRATCH, 'CLAUDE.md'))) fs.writeFileSync(path.join(SCRATCH, 'CLAUDE.md'), "# Agent libre\n\nEspace temporaire d'AgentDeck pour les demandes générales, hors de tout projet. Ne crée des fichiers ici que si on te le demande ; si la demande concerne un projet précis, demande son chemin (les projets sont en général sous ~/projects).\n");
+} catch (e) { console.error('agent libre', e.message); }
+const isScratch = (p) => p === SCRATCH;
+
 let projectCache = { at: 0, list: [] };
 async function discoverProjects(force) {
   if (!force && Date.now() - projectCache.at < 10000) return projectCache.list;
@@ -237,6 +253,19 @@ async function discoverProjects(force) {
   for (const p of config.extra) if (fs.existsSync(p)) add(p);
   const list = await Promise.all([...found].map(async ([id, p]) => ({ id, path: p, name: path.basename(p), parked: config.parked.includes(p), account: projectAccount(p).key, lastActivity: await lastActivity(p) })));
   list.sort((a, b) => b.lastActivity - a.lastActivity);
+  // Dossier supprimé mais agents encore en vie (ex. : Claude a effacé son propre projet) : on garde une entrée
+  // fantôme pour pouvoir fermer ces agents depuis l'interface
+  try {
+    const live = await listSessions();
+    for (const name of Object.keys(live)) {
+      const m = /^ad_([0-9a-f]{10})_\d$/.exec(name);
+      if (!m || found.has(m[1]) || list.some((x) => x.id === m[1])) continue;
+      const rec = slotsState[name];
+      if (!rec || !rec.project) continue;
+      list.push({ id: m[1], path: rec.project, name: path.basename(rec.project), missing: true, parked: false, account: projectAccount(rec.project).key, lastActivity: rec.startedAt || 0 });
+    }
+  } catch {}
+  list.unshift({ id: projId(SCRATCH), path: SCRATCH, name: 'Agent libre', scratch: true, parked: false, account: projectAccount(SCRATCH).key, lastActivity: await lastActivity(SCRATCH) });
   projectCache = { at: Date.now(), list };
   return list;
 }
@@ -499,7 +528,7 @@ const withProject = (fn) => wrap(async (req, res) => {
   return fn(req, res, p);
 });
 
-app.get('/api/config', (req, res) => res.json({ host: os.hostname(), slots: SLOTS, staleDays: config.staleDays, commands: config.commands.map(({ key, label }) => ({ key, label })), accounts: config.accounts, projectAccounts: config.projectAccounts, accountSwitch: config.accountSwitch, cloneRoot: cloneRoot(), voice: config.voice }));
+app.get('/api/config', (req, res) => res.json({ host: os.hostname(), slots: SLOTS, staleDays: config.staleDays, commands: config.commands.map(({ key, label }) => ({ key, label })), accounts: config.accounts, projectAccounts: config.projectAccounts, accountSwitch: config.accountSwitch, cloneRoot: cloneRoot(), voice: { ...config.voice, stt: !!secret('OPENAI_API_KEY'), tts: !!secret('OPENAI_API_KEY') } }));
 
 app.get('/api/projects', wrap(async (req, res) => res.json(await discoverProjects(req.query.refresh === '1'))));
 
@@ -516,8 +545,16 @@ app.post('/api/projects', wrap(async (req, res) => {
   res.json({ id: projId(p), path: p, name: path.basename(p) });
 }));
 
-// « Au repos » : arrête tous les agents du projet (sans reprise auto) et le range tout en bas de la liste
+// La croix de la liste : arrête tous les agents du projet (sans reprise auto). Le projet reste dans la liste,
+// il retombe simplement dans « Récents » comme n'importe quel projet sans agent.
+app.post('/api/projects/:id/stop', withProject(async (req, res, p) => {
+  await stopProject(p);
+  res.json({ ok: true });
+}));
+
+// « Au repos » (plus utilisé par l'interface) : arrête les agents et sort le projet de la liste
 app.post('/api/projects/:id/park', withProject(async (req, res, p) => {
+  if (p.scratch) return res.status(400).json({ error: "l'agent libre reste toujours dans la liste" });
   const parked = !!(req.body && req.body.parked);
   config.parked = config.parked.filter((x) => x !== p.path);
   if (parked) { config.parked.push(p.path); await stopProject(p); }
@@ -594,7 +631,9 @@ async function fetchUsage(account = getAccount('default')) {
     const extra = j.extra_usage && j.extra_usage.is_enabled ? { percent: Number(j.extra_usage.utilization) || 0, used: j.extra_usage.used_credits, limit: j.extra_usage.monthly_limit, currency: j.extra_usage.currency } : null;
     usageCache = { at: Date.now(), error: null, data: { plan: creds.subscriptionType || null, tier: creds.rateLimitTier || null, limits, extra } };
   } catch (e) {
-    usageCache = { at: Date.now(), data: usageCache.data, error: e.name === 'TimeoutError' ? 'API usage injoignable' : e.message };
+    // 429 : l'API limite les appels ; on garde la dernière valeur et on n'insiste pas avant 5 min
+    const limited = /HTTP 429/.test(e.message);
+    usageCache = { at: Date.now() + (limited ? 4 * USAGE_TTL : 0), data: usageCache.data, error: limited ? 'API usage saturée (429), nouvel essai dans 5 min' : e.name === 'TimeoutError' ? 'API usage injoignable' : e.message };
   }
   usageCaches.set(account.key, usageCache);
   return usageCache;
@@ -608,6 +647,7 @@ app.get('/api/usage', wrap(async (req, res) => {
 // ---------- comptes : API ----------
 // Tous les comptes avec identité, usage et nombre de projets/agents qui s'en servent
 app.get('/api/accounts', wrap(async (req, res) => {
+  if (req.query.refresh === '1') usageCaches.clear();
   const [live, projects] = await Promise.all([listSessions(), discoverProjects()]);
   const out = await Promise.all(config.accounts.map(async (a) => {
     const [id, u] = await Promise.all([accountIdentity(a), fetchUsage(a)]);
@@ -660,6 +700,15 @@ app.post('/api/accounts/:key/login', wrap(async (req, res) => {
   res.json({ ok: true, session: name });
 }));
 
+// Annule une connexion en cours (fenêtre fermée, code jamais saisi…) : tue la session tmux de login
+app.delete('/api/accounts/:key/login', wrap(async (req, res) => {
+  const key = req.params.key;
+  if (key !== 'gh' && !config.accounts.some((a) => a.key === key)) return res.status(404).json({ error: 'compte inconnu' });
+  try { await tmux('kill-session', '-t', '=' + loginSession(key)); } catch {}
+  usageCaches.delete(key);
+  res.json({ ok: true });
+}));
+
 app.post('/api/account-switch', wrap(async (req, res) => {
   const b = req.body || {};
   config.accountSwitch = { enabled: !!b.enabled, threshold: Math.max(10, Math.min(100, Number(b.threshold) || 80)) };
@@ -688,17 +737,13 @@ app.get('/api/repos/status', wrap(async (req, res) => res.json({ ...(await ghSta
 
 app.get('/api/repos', wrap(async (req, res) => {
   if (req.query.refresh !== '1' && Date.now() - ghCache.at < 120000 && ghCache.data) return res.json(ghCache.data);
-  const fields = 'nameWithOwner,description,updatedAt,isPrivate,url,isFork,isArchived';
+  // Tout ce à quoi le compte a accès : ses dépôts, ceux de ses organisations, et ceux où il est invité comme
+  // collaborateur (que `gh repo list` ne montre pas). Une ligne JSON par dépôt, toutes pages confondues.
   let repos = [];
   try {
-    repos = JSON.parse(await run('gh', ['repo', 'list', '--limit', '300', '--json', fields], { timeout: 30000 }));
-    // dépôts des organisations aussi, sans bloquer si ça échoue
-    try {
-      const orgs = JSON.parse(await run('gh', ['api', 'user/orgs', '--jq', '[.[].login]'], { timeout: 8000 }));
-      for (const o of orgs.slice(0, 10)) {
-        try { repos.push(...JSON.parse(await run('gh', ['repo', 'list', o, '--limit', '200', '--json', fields], { timeout: 20000 }))); } catch {}
-      }
-    } catch {}
+    const jq = '.[] | {nameWithOwner: .full_name, description, updatedAt: (.pushed_at // .updated_at), isPrivate: .private, url: .html_url, isFork: .fork, isArchived: .archived}';
+    const out = await run('gh', ['api', '--paginate', 'user/repos?affiliation=owner,collaborator,organization_member&per_page=100&sort=pushed', '--jq', jq], { timeout: 60000 });
+    repos = out.split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch (e) { return res.status(502).json({ error: 'gh : ' + ((e.stderr || e.message || '').trim().split('\n')[0]) }); }
   const root = cloneRoot();
   const existing = new Set((await discoverProjects()).map((p) => path.basename(p.path).toLowerCase()));
@@ -737,6 +782,47 @@ app.post('/api/repos/clone', wrap(async (req, res) => {
   res.json({ id: projId(dest), path: dest, name: base });
 }));
 
+// Nouveau dépôt : dossier vide dans le dossier des projets, git init + premier commit, et (optionnel) création du
+// dépôt GitHub via gh avec push. Si GitHub échoue, le projet local est quand même créé (avertissement renvoyé).
+app.post('/api/repos/new', wrap(async (req, res) => {
+  const name = String((req.body && req.body.name) || '').trim();
+  const github = ['private', 'public'].includes(req.body && req.body.github) ? req.body.github : null;
+  const description = String((req.body && req.body.description) || '').trim().slice(0, 350);
+  if (!/^[\w.-]+$/.test(name) || name.startsWith('.') || name.endsWith('.git')) return res.status(400).json({ error: 'nom de dépôt invalide (lettres, chiffres, - _ .)' });
+  const root = cloneRoot();
+  const dest = path.join(root, name);
+  if (fs.existsSync(dest)) return res.status(409).json({ error: `le dossier ${dest} existe déjà` });
+  if (cloning.has(dest)) return res.status(409).json({ error: 'création déjà en cours' });
+  cloning.add(dest);
+  let warning = null;
+  try {
+    await fsp.mkdir(dest, { recursive: true });
+    await fsp.writeFile(path.join(dest, 'README.md'), `# ${name}\n${description ? '\n' + description + '\n' : ''}`);
+    await fsp.writeFile(path.join(dest, '.gitignore'), 'node_modules/\n.env\n*.log\n.DS_Store\n');
+    // identité git de secours si l'utilisateur n'en a pas configuré, sinon le commit échoue
+    const ident = [];
+    try { await run('git', ['config', '--get', 'user.email']); } catch { ident.push('-c', 'user.name=AgentDeck', '-c', 'user.email=agentdeck@' + os.hostname()); }
+    const g = (...a) => run('git', [...ident, '-C', dest, ...a], { timeout: 30000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+    await g('init', '-q', '-b', 'main');
+    await g('add', '-A');
+    await g('commit', '-q', '-m', 'Initial commit');
+    if (github) {
+      try {
+        const args = ['repo', 'create', name, '--' + github, '--source', dest, '--remote', 'origin', '--push'];
+        if (description) args.push('--description', description);
+        await run('gh', args, { timeout: 120000 });
+      } catch (e) { warning = 'GitHub : ' + ((e.stderr || e.message || '').trim().split('\n').filter(Boolean).pop() || 'création du dépôt distant échouée'); }
+    }
+  } catch (e) {
+    await fsp.rm(dest, { recursive: true, force: true }).catch(() => {});
+    return res.status(502).json({ error: 'nouveau dépôt : ' + ((e.stderr || e.message || '').trim().split('\n').filter(Boolean).pop() || 'échec') });
+  } finally { cloning.delete(dest); }
+  if (!config.roots.includes(root) && !config.extra.includes(dest)) { config.extra.push(dest); saveConfig(); }
+  ghCache.at = 0;
+  await discoverProjects(true);
+  res.json({ id: projId(dest), path: dest, name, warning });
+}));
+
 // Connexion GitHub : fenêtre terminal sur `gh auth login` (code à saisir sur github.com), puis git utilise gh pour s'identifier
 app.post('/api/repos/login', wrap(async (req, res) => {
   const name = loginSession('gh');
@@ -750,6 +836,74 @@ app.post('/api/repos/login', wrap(async (req, res) => {
 }));
 
 // ---------- contrôle vocal ----------
+// Synthèse vocale : texte → audio mp3 via OpenAI TTS, avec consigne de style (« Jarvis »). Le navigateur le joue
+// à la place de la voix système. Petit cache mémoire : les mêmes phrases reviennent souvent.
+const TTS_URL = 'https://api.openai.com/v1/audio/speech';
+const ttsCache = new Map();
+app.post('/api/voice/speak', wrap(async (req, res) => {
+  const key = secret('OPENAI_API_KEY');
+  if (!key) return res.status(503).json({ error: 'synthèse non configurée : OPENAI_API_KEY manquante' });
+  const text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+  if (!text) return res.status(400).json({ error: 'texte vide' });
+  const tts = (config.voice && config.voice.tts) || {};
+  const ck = crypto.createHash('sha1').update([tts.model, tts.voice, tts.instructions, text].join('\u0000')).digest('hex');
+  let audio = ttsCache.get(ck);
+  if (!audio) {
+    let r;
+    try {
+      r = await fetch(TTS_URL, {
+        method: 'POST', headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({ model: tts.model || 'gpt-4o-mini-tts', voice: tts.voice || 'ash', input: text, instructions: tts.instructions || undefined, response_format: 'mp3', speed: tts.speed || 1 }),
+      });
+    } catch (e) { return res.status(502).json({ error: e.name === 'TimeoutError' ? 'synthèse : délai dépassé' : 'synthèse injoignable' }); }
+    if (!r.ok) { const j = await r.json().catch(() => ({})); return res.status(502).json({ error: 'synthèse : ' + ((j.error && j.error.message) || ('HTTP ' + r.status)).slice(0, 200) }); }
+    audio = Buffer.from(await r.arrayBuffer());
+    ttsCache.set(ck, audio);
+    if (ttsCache.size > 200) ttsCache.delete(ttsCache.keys().next().value);
+  }
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.end(audio);
+}));
+
+// Secrets hors git : data/secrets.env (KEY=valeur par ligne), prioritaire sur l'environnement du service
+const SECRETS_FILE = path.join(DATA, 'secrets.env');
+function secret(name) {
+  try {
+    for (const line of fs.readFileSync(SECRETS_FILE, 'utf8').split('\n')) {
+      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (m && m[1] === name) return m[2].replace(/^["']|["']$/g, '');
+    }
+  } catch {}
+  return process.env[name] || '';
+}
+
+// Transcription : le navigateur enregistre (webm/opus ou mp4) et envoie l'audio brut ; on le passe à
+// gpt-4o-transcribe avec la langue et un prompt de vocabulaire (noms des projets) pour qu'ils soient bien reconnus.
+const STT_URL = 'https://api.openai.com/v1/audio/transcriptions';
+const STT_EXT = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'mp4', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac', 'audio/aac': 'aac' };
+app.post('/api/voice/transcribe', express.raw({ type: () => true, limit: '25mb' }), wrap(async (req, res) => {
+  const key = secret('OPENAI_API_KEY');
+  if (!key) return res.status(503).json({ error: 'transcription non configurée : OPENAI_API_KEY manquante dans data/secrets.env' });
+  const mime = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  const ext = STT_EXT[mime];
+  if (!ext || !Buffer.isBuffer(req.body) || req.body.length < 1000) return res.status(400).json({ error: 'audio attendu (webm, ogg, mp4, wav…)' });
+  const lang = ((config.voice && config.voice.lang) || 'fr-FR').split('-')[0];
+  const names = (await discoverProjects()).filter((p) => !p.parked).slice(0, 60).map((p) => p.name).join(', ');
+  const form = new FormData();
+  form.append('file', new Blob([req.body], { type: mime }), 'voice.' + ext);
+  form.append('model', (config.voice && config.voice.stt && config.voice.stt.model) || 'gpt-4o-transcribe');
+  form.append('language', lang);
+  form.append('response_format', 'json');
+  form.append('prompt', `Commande vocale pour Agent Deck, qui pilote des agents Claude Code numérotés de 1 à 4 par projet. Noms des projets : ${names}.`);
+  let r;
+  try { r = await fetch(STT_URL, { method: 'POST', headers: { authorization: 'Bearer ' + key }, body: form, signal: AbortSignal.timeout(45000) }); }
+  catch (e) { return res.status(502).json({ error: e.name === 'TimeoutError' ? 'transcription : délai dépassé' : 'transcription injoignable' }); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return res.status(502).json({ error: 'transcription : ' + ((j.error && j.error.message) || ('HTTP ' + r.status)).slice(0, 200) });
+  res.json({ text: String(j.text || '').trim() });
+}));
+
 // Une seule entrée (voix ou texte). Un Claude headless (claude -p, abonnement, pas d'outils) reçoit l'état des
 // projets et agents et décide : envoyer l'instruction à un agent qui tourne, en démarrer un, ou juste répondre.
 const VOICE_SCHEMA = JSON.stringify({
@@ -768,9 +922,10 @@ L'utilisateur parle à voix haute ; sa phrase a été transcrite, elle peut cont
 Tu reçois l'état des projets et des agents (état + dernières lignes de terminal). Décide :
 - "send" : transmettre l'instruction à un agent qui tourne déjà (projectId + slot 0-3). Préfère l'agent dont le terminal montre qu'il travaille sur le sujet, sinon un agent qui attend. Un agent en attente d'autorisation ("perm") attend une réponse comme "oui"/"y" : si l'utilisateur dit d'accepter, envoie "y".
 - "start" : démarrer un nouvel agent dans un projet (projectId) avec l'instruction, si aucun agent de ce projet ne convient ou si l'utilisateur le demande.
+  Pour une demande générale qui ne concerne aucun projet (question, recherche, calcul…), utilise le projet "Agent libre".
 - "reply" : si la demande est une question sur l'état (qui travaille sur quoi, qui attend) ou si tu ne peux pas déterminer la cible : réponds ou demande une précision, sans rien envoyer.
 "instruction" : la consigne reformulée proprement pour l'agent (impérative, claire, en français ou dans la langue de l'utilisateur), pas la transcription brute. Jamais de retour à la ligne.
-"reply" : une phrase courte qui sera lue à voix haute : ce que tu as fait ou la réponse. Nomme le projet et le numéro d'agent (1-4, soit slot+1). Pas de markdown.`;
+"reply" : lue à voix haute, c'est une conversation à l'oral, pas un rapport : une ou deux phrases naturelles, comme tu le dirais à quelqu'un à côté de toi. Ton calme et direct, façon Jarvis, un peu d'esprit bienvenu. Pour "send"/"start" : dis à qui c'est parti et en quoi ça consiste en quelques mots, sans réciter la consigne (ex. "C'est parti pour l'agent 2 de cabal, il s'occupe des tests."). Pour une question d'état : réponds en groupant, l'essentiel seulement (ex. "Trois agents t'attendent : le 1 de coldforge et les 2 et 4 de mod ; les autres bossent encore."). Jamais de liste, jamais de paragraphe, pas de markdown.`;
 
 const shq = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
 async function paneTail(name, lines = 12) {
@@ -925,7 +1080,7 @@ app.post('/api/projects/:id/slots/:slot/stop', withProject(async (req, res, p) =
 const inflight = new Set();
 app.post('/api/projects/:id/autoresume', withProject(async (req, res, p) => {
   const ar = config.autoResume;
-  if (!ar.enabled || autoState.suppressed.includes(p.path) || inflight.has(p.id)) return res.json({ started: [] });
+  if (!ar.enabled || p.scratch || autoState.suppressed.includes(p.path) || inflight.has(p.id)) return res.json({ started: [] });
   inflight.add(p.id);
   try {
     const live = await listSessions();
@@ -974,9 +1129,16 @@ app.get('/api/projects/:id/stat', withProject(async (req, res, p) => {
 // presse-papiers), donc le navigateur envoie l'image ici ; on la range dans le projet et le client tape son chemin.
 const PASTE_DIR = '.agentdeck/pastes';
 const PASTE_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
-app.post('/api/projects/:id/paste', express.raw({ type: Object.keys(PASTE_EXT), limit: '20mb' }), withProject(async (req, res, p) => {
-  const ext = PASTE_EXT[(req.headers['content-type'] || '').split(';')[0]];
-  if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'image attendue (png, jpeg, gif, webp)' });
+// Nom de fichier sûr : juste le nom de base, caractères simples, pas de chemin
+const safeName = (n) => String(n || '').split(/[\\/]/).pop().replace(/[^\w.\- ()\[\]+@àâäéèêëîïôöùûüç]/gi, '_').replace(/^\.+/, '').slice(0, 120);
+
+// Collage / dépôt dans un terminal : n'importe quel fichier, rangé dans .agentdeck/pastes/ (temporaire, une
+// semaine), et son chemin est tapé dans le terminal pour que Claude le lise.
+app.post('/api/projects/:id/paste', express.raw({ type: () => true, limit: '200mb' }), withProject(async (req, res, p) => {
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'fichier vide' });
+  const mime = String(req.query.type || req.headers['content-type'] || '').split(';')[0];
+  const given = safeName(req.query.name).replace(/\s+/g, '_'); // pas d'espace : le chemin est tapé tel quel dans le terminal
+  const ext = given.includes('.') ? '' : '.' + (PASTE_EXT[mime] || 'bin');
   const dir = path.join(p.path, PASTE_DIR);
   await fsp.mkdir(dir, { recursive: true });
   // Exclusion git locale (jamais commitée) pour ne pas polluer le statut du projet
@@ -990,9 +1152,25 @@ app.post('/api/projects/:id/paste', express.raw({ type: Object.keys(PASTE_EXT), 
     const st = await fsp.stat(path.join(dir, f)).catch(() => null);
     if (st && Date.now() - st.mtimeMs > 7 * 86400e3) await fsp.unlink(path.join(dir, f)).catch(() => {});
   }
-  const name = `paste-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-')}-${crypto.randomBytes(2).toString('hex')}.${ext}`;
+  const stamp = `${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-')}-${crypto.randomBytes(2).toString('hex')}`;
+  const name = given ? `${stamp}-${given}${ext}` : `paste-${stamp}${ext}`;
   await fsp.writeFile(path.join(dir, name), req.body);
   res.json({ path: `${PASTE_DIR}/${name}`, size: req.body.length });
+}));
+
+// Upload permanent dans le projet (bouton ⬆ ou dépôt sur l'arbre de fichiers) : ?dir=<dossier relatif>&name=<fichier>.
+// Refuse d'écraser un fichier existant sauf ?overwrite=1.
+app.post('/api/projects/:id/upload', express.raw({ type: () => true, limit: '200mb' }), withProject(async (req, res, p) => {
+  if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: 'fichier vide' });
+  const name = safeName(req.query.name);
+  if (!name) return res.status(400).json({ error: 'nom de fichier manquant' });
+  const dir = resolveIn(p.path, String(req.query.dir || ''));
+  const st = await fsp.stat(dir).catch(() => null);
+  if (!st || !st.isDirectory()) return res.status(400).json({ error: 'dossier introuvable' });
+  const dest = path.join(dir, name);
+  if (req.query.overwrite !== '1' && fs.existsSync(dest)) return res.status(409).json({ error: `${name} existe déjà` });
+  await fsp.writeFile(dest, req.body);
+  res.json({ path: path.relative(p.path, dest), size: req.body.length });
 }));
 
 app.get('/api/projects/:id/file', withProject(async (req, res, p) => {
@@ -1063,7 +1241,7 @@ async function onTerminal(ws, url) {
     const p = await getProject(url.searchParams.get('project'));
     const slot = Number(url.searchParams.get('slot'));
     if (!p || !(slot >= 0 && slot < SLOTS)) return ws.close(4004, 'introuvable');
-    name = sessionName(p.id, slot); cwd = p.path;
+    name = sessionName(p.id, slot); cwd = fs.existsSync(p.path) ? p.path : HOME;
   }
   if (!(await hasSession(name))) return ws.close(4010, 'pas de session');
   const cols = Number(url.searchParams.get('cols')) || 120;

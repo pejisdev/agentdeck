@@ -6,6 +6,7 @@ id=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""
 case "$id" in
   *[!0-9a-f-]*|"") exit 0 ;;
 esac
-mkdir -p "$HOME/agentdeck/data/sessions"
-printf '%s' "$id" > "$HOME/agentdeck/data/sessions/$AGENTDECK_SESSION"
+dir="$(cd "$(dirname "$0")/.." && pwd)/data/sessions"
+mkdir -p "$dir"
+printf '%s' "$id" > "$dir/$AGENTDECK_SESSION"
 exit 0
