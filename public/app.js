@@ -332,6 +332,8 @@ class Pane {
     term.loadAddon(new WebLinksAddon.WebLinksAddon());
     try { term.loadAddon(new ClipboardAddon.ClipboardAddon()); } catch {}
     term.open(holder);
+    // Rendu WebGL : bien plus léger que le rendu DOM pour les redessins permanents de Claude Code. Repli silencieux sinon.
+    try { const gl = new WebglAddon.WebglAddon(); gl.onContextLoss(() => gl.dispose()); term.loadAddon(gl); } catch {}
     term.onData((d) => this.send({ t: 'i', d }));
     term.onResize(({ cols, rows }) => this.send({ t: 'r', c: cols, r: rows }));
     term.attachCustomKeyEventHandler((e) => {
@@ -369,7 +371,7 @@ class Pane {
   }
 
   connect() {
-    if (this.ws) return;
+    if (this.ws || this.deck.el.hidden) return; // deck caché : on ne décode pas un terminal que personne ne voit
     this.ensureTerm();
     this.doFit();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -388,9 +390,13 @@ class Pane {
   isRunning() { return !!(S.status[this.deck.id] && S.status[this.deck.id][this.slot]); }
 
   teardown() {
-    if (this.ws) { const ws = this.ws; this.ws = null; ws.close(); }
-    if (this.term) { this.term.dispose(); this.term = null; }
+    this.sleep();
     this.showPlaceholder();
+  }
+  // Deck caché : on coupe le flux et on libère le terminal. tmux garde tout, l'affichage est redessiné au retour.
+  sleep() {
+    if (this.ws) { const ws = this.ws; this.ws = null; ws.close(); }
+    if (this.term) { this.term.dispose(); this.term = null; this.body.textContent = ''; }
   }
 
   send(msg) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(msg)); }
@@ -426,7 +432,11 @@ class Deck {
     for (let i = 0; i < S.cfg.slots; i++) { const p = new Pane(this, i); this.panes.push(p); this.el.append(p.el); }
     $('#decks').append(this.el);
   }
-  show(on) { this.el.hidden = !on; if (on) this.panes.forEach((p) => { p.update(); p.scheduleFit(); }); }
+  show(on) {
+    this.el.hidden = !on;
+    if (on) this.panes.forEach((p) => { p.update(); p.scheduleFit(); });
+    else this.panes.forEach((p) => p.sleep());
+  }
 }
 
 function setLayout(l) {

@@ -58,6 +58,9 @@ ExecStart=$(command -v node) server.js
 Restart=always
 # ne tue que node au redémarrage : le serveur tmux et les agents restent en vie
 KillMode=process
+# priorité au cockpit et à ses agents face aux builds Docker : les frappes restent fluides quand la machine est chargée
+Nice=-5
+CPUWeight=500
 
 [Install]
 WantedBy=multi-user.target

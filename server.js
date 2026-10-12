@@ -516,6 +516,7 @@ app.use(express.static(path.join(__dirname, 'public'), { setHeaders: (res) => re
 app.use('/vendor/xterm', express.static(path.join(__dirname, 'node_modules/@xterm/xterm')));
 app.use('/vendor/xterm-fit', express.static(path.join(__dirname, 'node_modules/@xterm/addon-fit')));
 app.use('/vendor/xterm-links', express.static(path.join(__dirname, 'node_modules/@xterm/addon-web-links')));
+app.use('/vendor/xterm-webgl', express.static(path.join(__dirname, 'node_modules/@xterm/addon-webgl')));
 app.use('/vendor/xterm-clipboard', express.static(path.join(__dirname, 'node_modules/@xterm/addon-clipboard')));
 app.use('/vendor/monaco', express.static(path.join(__dirname, 'node_modules/monaco-editor')));
 
@@ -1250,10 +1251,13 @@ async function onTerminal(ws, url) {
     name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
   });
   term.onData((d) => { if (ws.readyState === 1) ws.send(d); });
-  term.onExit(() => { if (ws.readyState === 1) ws.close(1000, 'fin'); });
+  let gone = false;
+  term.onExit(() => { gone = true; if (ws.readyState === 1) ws.close(1000, 'fin'); });
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.t === 'i' && typeof msg.d === 'string') term.write(msg.d);
+    // le pty peut être déjà fermé (session tuée) : on ignore plutôt que de laisser remonter un EBADF
+    if (gone) return;
+    if (msg.t === 'i' && typeof msg.d === 'string') { try { term.write(msg.d); } catch {} }
     else if (msg.t === 'r') { try { term.resize(Math.max(2, msg.c | 0), Math.max(2, msg.r | 0)); } catch {} }
   });
   ws.on('close', () => { try { term.kill(); } catch {} }); // détache seulement, la session tmux continue
