@@ -158,7 +158,7 @@ async function pickAccount(preferred) {
 
 // ---------- attention (agent qui attend) ----------
 // Les hooks Claude (hooks/agent-event.sh, installés dans ~/.claude/settings.json au démarrage) écrivent
-// data/events/<emplacement> : « permission » (autorisation ou question posée), « done » (tour terminé, à toi),
+// data/events/<emplacement> : « permission » (autorisation), « question » (AskUserQuestion), « done » (tour terminé, à toi),
 // « working » (tu as répondu / un outil tourne). Ça remplace l'heuristique « plus d'activité = a fini ».
 const EVENTS_DIR = path.join(DATA, 'events');
 fs.mkdirSync(EVENTS_DIR, { recursive: true });
@@ -185,6 +185,8 @@ const WANTED_HOOKS = {
     { matcher: 'idle_prompt', hooks: [{ type: 'command', command: `${HOOK_SCRIPT} done`, async: true, timeout: 10 }] },
   ],
   Stop: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} done`, async: true, timeout: 10 }] }],
+  // L'agent pose une question (AskUserQuestion) : aucune Notification n'est émise en mode sans permissions, d'où PreToolUse
+  PreToolUse: [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: `${HOOK_SCRIPT} question`, async: true, timeout: 10 }] }],
   UserPromptSubmit: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} working`, async: true, timeout: 10 }] }],
   PostToolUse: [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} working`, async: true, timeout: 10 }] }],
 };
@@ -953,7 +955,7 @@ async function voiceContext(currentId) {
       if (!live[n]) { lines.push(`- agent ${i + 1} (slot ${i}) : libre`); continue; }
       const s = live[n];
       const att = await readAttention(n);
-      const state = now - s.activity < 3500 ? 'busy (travaille)' : att ? (att.kind === 'permission' ? 'perm (attend une autorisation / réponse)' : 'done (a fini, attend une consigne)') : 'idle';
+      const state = now - s.activity < 3500 ? 'busy (travaille)' : att ? (att.kind === 'permission' ? 'perm (attend une autorisation / réponse)' : att.kind === 'question' ? `ask (pose une question : ${(att.message || '').slice(0, 200)})` : 'done (a fini, attend une consigne)') : 'idle';
       const tail = await paneTail(n);
       lines.push(`- agent ${i + 1} (slot ${i}) : ${state}${s.command && s.command !== 'claude' ? ` [${s.command}]` : ''}`);
       if (tail) lines.push('  terminal :', ...tail.split('\n').map((l) => '    ' + l));
@@ -1071,6 +1073,30 @@ async function stopProject(p) {
   const live = await listSessions();
   for (let i = 0; i < SLOTS; i++) if (live[sessionName(p.id, i)]) await stopSlot(p, i);
 }
+
+// « Toi, t'es l'agent X maintenant » : renumérote un agent ; si la place est prise, les deux s'échangent.
+// Tout ce qui est indexé par nom d'emplacement suit (session tmux, conversation à reprendre, événements, voix).
+async function renameSlot(x, y, slot) {
+  if (await hasSession(x)) { await tmux('rename-session', '-t', '=' + x, y); await tmux('set-environment', '-t', '=' + y, 'AGENTDECK_SESSION', y).catch(() => {}); }
+  for (const dir of [SESS_DIR, EVENTS_DIR]) await fsp.rename(path.join(dir, x), path.join(dir, y)).catch(() => {});
+  if (slotsState[x]) { slotsState[y] = { ...slotsState[x], slot }; delete slotsState[x]; }
+  if (voiceTargets.has(x)) { voiceTargets.set(y, voiceTargets.get(x)); voiceTargets.delete(x); }
+}
+app.post('/api/projects/:id/slots/:slot/move', withProject(async (req, res, p) => {
+  const from = Number(req.params.slot), to = Number(req.body && req.body.to);
+  if (!(from >= 0 && from < SLOTS) || !(to >= 0 && to < SLOTS)) return res.status(400).json({ error: 'emplacement invalide' });
+  if (from === to) return res.json({ ok: true });
+  const a = sessionName(p.id, from), b = sessionName(p.id, to);
+  if (!(await hasSession(a))) return res.status(409).json({ error: `l'agent ${from + 1} ne tourne pas` });
+  const tmp = `${a}_tmp${Date.now()}`;
+  await renameSlot(a, tmp, to);
+  await renameSlot(b, a, from); // l'autre agent, ou la conversation « à reprendre » de la place vide, prend l'ancien numéro
+  await renameSlot(tmp, b, to);
+  delete slotsState[tmp];
+  saveSlots();
+  res.json({ ok: true });
+  detachAll([a, b], 4011, 'renuméroté');
+}));
 
 app.post('/api/projects/:id/slots/:slot/stop', withProject(async (req, res, p) => {
   await stopSlot(p, Number(req.params.slot));
@@ -1245,6 +1271,7 @@ async function onTerminal(ws, url) {
     name = sessionName(p.id, slot); cwd = fs.existsSync(p.path) ? p.path : HOME;
   }
   if (!(await hasSession(name))) return ws.close(4010, 'pas de session');
+  (attachedWs.get(name) || attachedWs.set(name, new Set()).get(name)).add(ws);
   const cols = Number(url.searchParams.get('cols')) || 120;
   const rows = Number(url.searchParams.get('rows')) || 30;
   const term = pty.spawn('tmux', ['-L', TMUX_SOCK, '-f', TMUX_CONF, 'attach-session', '-t', '=' + name], {
@@ -1260,7 +1287,13 @@ async function onTerminal(ws, url) {
     if (msg.t === 'i' && typeof msg.d === 'string') { try { term.write(msg.d); } catch {} }
     else if (msg.t === 'r') { try { term.resize(Math.max(2, msg.c | 0), Math.max(2, msg.r | 0)); } catch {} }
   });
-  ws.on('close', () => { try { term.kill(); } catch {} }); // détache seulement, la session tmux continue
+  ws.on('close', () => { try { term.kill(); } catch {} const s = attachedWs.get(name); if (s) { s.delete(ws); if (!s.size) attachedWs.delete(name); } }); // détache seulement, la session tmux continue
+}
+// Terminaux attachés par nom d'emplacement : après une renumérotation, on les ferme pour que chaque onglet
+// (y compris les autres navigateurs) se rattache à son numéro et montre le bon agent
+const attachedWs = new Map();
+function detachAll(names, code, reason) {
+  for (const n of names) for (const ws of attachedWs.get(n) || []) { try { ws.close(code, reason); } catch {} }
 }
 
 restoreSlots().finally(() => setInterval(() => watchSlots().catch(() => {}), 5000));

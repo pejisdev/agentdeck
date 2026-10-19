@@ -68,10 +68,10 @@ function slotState(id, slot) {
   const s = S.status[id] && S.status[id][slot];
   if (!s) return 'off';
   if (S.now - s.activity < BUSY_MS) return 'busy';
-  if (s.attention) return s.attention.kind === 'permission' ? 'perm' : 'attn';
+  if (s.attention) return { permission: 'perm', question: 'ask' }[s.attention.kind] || 'attn';
   return 'idle';
 }
-const needsYou = (st) => st === 'perm' || st === 'attn';
+const needsYou = (st) => st === 'perm' || st === 'ask' || st === 'attn';
 
 function ago(ts) {
   if (!ts) return '';
@@ -154,7 +154,10 @@ async function hideProject(p) {
   loadProjects();
 }
 
-$('#projFilter').addEventListener('input', renderProjects);
+$('#projFilter').addEventListener('input', () => { $('#projFilterClear').hidden = !$('#projFilter').value; renderProjects(); });
+$('#projFilter').addEventListener('keydown', (e) => { if (e.key === 'Escape') clearProjFilter(); });
+function clearProjFilter() { $('#projFilter').value = ''; $('#projFilterClear').hidden = true; renderProjects(); $('#projFilter').focus(); }
+$('#projFilterClear').addEventListener('click', clearProjFilter);
 $('#refreshProj').addEventListener('click', () => loadProjects(true).then(() => toast('Projets rescannés')));
 // ---------------------------------------------------------------- ajouter un projet : GitHub, URL git, dossier existant
 let repos = [], repoStatus = null;
@@ -242,20 +245,60 @@ class Pane {
     this.acctEl = h('span', { class: 'acct-tag', hidden: '' });
     this.killBtn = h('button', { class: 'kill', title: 'Arrêter la session', onclick: () => this.stop() }, '■');
     this.maxBtn = h('button', { title: 'Agrandir (double-clic sur l\'en-tête)', onclick: () => this.toggleMax() }, '⤢');
+    // Réduit (2 colonnes) : choisir explicitement la colonne où le faire monter
+    this.sideBtns = [0, 1].map((side) => h('button', { class: 'side', title: side ? 'Afficher dans la colonne de droite' : 'Afficher dans la colonne de gauche', onclick: (e) => { e.stopPropagation(); this.deck.reveal(this.slot, side); } }, side ? '◨' : '◧'));
     this.body = h('div', { class: 'pane-body' });
     this.el = h('div', { class: 'pane' },
-      h('div', { class: 'pane-head', ondblclick: () => this.toggleMax() },
-        h('span', { class: 'num' }, String(slot + 1)), this.stateEl, this.cmdEl, this.acctEl, h('span', { class: 'spacer' }), this.killBtn, this.maxBtn),
+      h('div', { class: 'pane-head', ondblclick: () => this.toggleMax(), onclick: () => { if (!this.isShown()) this.deck.reveal(this.slot); } },
+        h('span', { class: 'num', title: 'Changer de numéro (ou glisse l\'en-tête sur un autre agent)', onclick: (e) => { e.stopPropagation(); this.slotMenu(); } }, String(slot + 1)), this.stateEl, this.cmdEl, this.acctEl, h('span', { class: 'spacer' }), ...this.sideBtns, this.killBtn, this.maxBtn),
       this.body);
+    this.head = this.el.firstChild;
+    // « Toi, t'es l'agent X maintenant » : glisser l'en-tête d'un agent sur un autre emplacement
+    this.head.addEventListener('dragstart', (e) => { if (!this.isRunning()) return e.preventDefault(); e.dataTransfer.setData(SLOT_DND, String(this.slot)); e.dataTransfer.effectAllowed = 'move'; });
+    this.el.addEventListener('dragover', (e) => { if (hasSlot(e)) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; this.el.classList.add('drop-slot'); } });
+    this.el.addEventListener('dragleave', () => this.el.classList.remove('drop-slot'));
+    this.el.addEventListener('drop', (e) => { if (!hasSlot(e)) return; e.preventDefault(); this.el.classList.remove('drop-slot'); const from = Number(e.dataTransfer.getData(SLOT_DND)); if (from !== this.slot) this.deck.panes[from].moveTo(this.slot); });
     this.el.addEventListener('mousedown', () => this.setFocus(), true);
     new ResizeObserver(() => this.scheduleFit()).observe(this.body);
     this.showPlaceholder();
   }
 
+  // Petit menu sous le numéro : vers quel emplacement déplacer cet agent (⇄ si la place est prise : échange)
+  slotMenu() {
+    if (this.menu) return this.closeMenu();
+    if (!this.isRunning()) return;
+    const items = [...Array(S.cfg.slots).keys()].filter((i) => i !== this.slot).map((i) => {
+      const busy = this.deck.panes[i].isRunning();
+      return h('button', { title: busy ? `Échanger avec l'agent ${i + 1}` : `Devenir l'agent ${i + 1}`, onclick: () => { this.closeMenu(); this.moveTo(i); } }, `${i + 1}${busy ? ' ⇄' : ''}`);
+    });
+    this.menu = h('div', { class: 'slot-menu' }, h('span', {}, 'Devenir l\'agent'), ...items);
+    this.head.append(this.menu);
+    setTimeout(() => document.addEventListener('mousedown', this._closeMenu = (e) => { if (!this.menu || this.menu.contains(e.target)) return; this.closeMenu(); }), 0);
+  }
+  closeMenu() {
+    if (this.menu) { this.menu.remove(); this.menu = null; }
+    if (this._closeMenu) { document.removeEventListener('mousedown', this._closeMenu); this._closeMenu = null; }
+  }
+  async moveTo(to) {
+    const d = this.deck, from = this.slot, other = d.panes[to];
+    try { await api(`${P(d.id)}/slots/${from}/move`, { method: 'POST', body: { to } }); } catch (e) { return toast(e.message, true); }
+    // Les deux panneaux se rattachent à leur nouvelle session ; en 2 colonnes, l'affichage suit l'agent déplacé
+    this.sleep(); other.sleep();
+    const swap = (x) => (x === from ? to : x === to ? from : x);
+    if (d.shown) { d.shown = d.shown.map(swap); store.set('shown:' + d.id, d.shown); }
+    [this.focusAt, other.focusAt] = [other.focusAt, this.focusAt];
+    toast(`Agent ${from + 1} → agent ${to + 1}`);
+    await pollStatus();
+    d.applyLayout();
+    const p = d.panes[to]; p.setFocus(); if (p.term) p.term.focus();
+  }
+
   setFocus() {
     if (S.focusPane && S.focusPane !== this) S.focusPane.el.classList.remove('focused');
-    S.focusPane = this; this.el.classList.add('focused');
+    S.focusPane = this; this.el.classList.add('focused'); this.focusAt = Date.now();
   }
+  // En 2 colonnes, seuls deux agents sont affichés en grand ; les autres gardent leur en-tête mais pas de terminal
+  isShown() { return S.layout !== 'two' || this.deck.shown.includes(this.slot); }
 
   showPlaceholder() {
     this.body.textContent = '';
@@ -371,7 +414,7 @@ class Pane {
   }
 
   connect() {
-    if (this.ws || this.deck.el.hidden) return; // deck caché : on ne décode pas un terminal que personne ne voit
+    if (this.ws || this.deck.el.hidden || !this.isShown()) return; // terminal invisible : on ne décode pas pour rien
     this.ensureTerm();
     this.doFit();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -383,6 +426,7 @@ class Pane {
       if (this.ws !== ws) return;
       this.ws = null;
       if (e.code === 4010 || e.code === 1000) { pollStatus(); return; } // session terminée : le poll mettra à jour
+      if (e.code === 4011) { this.term && this.term.reset(); pollStatus().then(() => this.update()); return; } // agent renuméroté : on se rattache à ce numéro
       if (this.retry++ < 20) setTimeout(() => { if (this.isRunning()) this.connect(); }, Math.min(5000, 300 * this.retry));
     };
   }
@@ -410,14 +454,15 @@ class Pane {
   update() {
     const running = this.isRunning();
     const st = running ? slotState(this.deck.id, this.slot) : 'off';
-    this.el.classList.remove('st-off', 'st-idle', 'st-busy', 'st-attn', 'st-perm');
+    this.el.classList.remove('st-off', 'st-idle', 'st-busy', 'st-attn', 'st-perm', 'st-ask');
     this.el.classList.add('st-' + st);
-    this.stateEl.textContent = { busy: 'Travaille…', idle: 'En attente', attn: 'A terminé — à toi', perm: 'Attend ton autorisation', off: 'Libre' }[st];
+    this.stateEl.textContent = { busy: 'Travaille…', idle: 'En attente', attn: 'A terminé — à toi', perm: 'Attend ton autorisation', ask: 'Te pose une question', off: 'Libre' }[st];
     const s = running && S.status[this.deck.id][this.slot];
     this.cmdEl.textContent = s && s.command && s.command !== 'bash' ? s.command : running ? 'shell' : '';
     const acct = s && s.account;
     this.acctEl.hidden = !(acct && (multiAccount() || acct !== 'default'));
     if (!this.acctEl.hidden) { this.acctEl.textContent = accountLabel(acct); this.acctEl.title = 'Compte Claude : ' + accountLabel(acct); }
+    this.head.draggable = running;
     if (running && !this.ws) this.connect();
     if (!running && this.term && !this.ws) this.teardown();
     else if (!running && !this.term && this.resumable !== !!(S.resumable[this.deck.id] && S.resumable[this.deck.id][this.slot])) this.showPlaceholder();
@@ -429,8 +474,31 @@ class Deck {
     this.id = id;
     this.el = h('div', { class: 'deck', 'data-layout': S.layout });
     this.panes = [];
+    this.shown = store.get('shown:' + id, [0, 1]);
     for (let i = 0; i < S.cfg.slots; i++) { const p = new Pane(this, i); this.panes.push(p); this.el.append(p.el); }
     $('#decks').append(this.el);
+    this.applyLayout();
+  }
+  applyLayout() {
+    this.panes.forEach((p) => {
+      const on = p.isShown(); p.el.classList.toggle('shown', on); if (!on) p.sleep();
+      // Colonne = position dans « shown » (gauche, droite), pas le numéro de l'agent
+      p.el.style.gridColumn = S.layout === 'two' && on ? String(this.shown.indexOf(p.slot) + 1) : '';
+    });
+    if (!this.el.hidden) this.panes.forEach((p) => { p.update(); p.scheduleFit(); });
+  }
+  // Fait monter un agent réduit : dans la colonne demandée (side 0 = gauche, 1 = droite), sinon à la place de celui
+  // des deux affichés dans lequel tu n'as pas travaillé en dernier (à égalité, la colonne de droite)
+  reveal(slot, side) {
+    if (S.layout !== 'two' || this.shown.includes(slot)) return;
+    if (side !== 0 && side !== 1) {
+      const [l, r] = this.shown.map((x) => this.panes[x].focusAt || 0);
+      side = l > r ? 1 : 0;
+    }
+    this.shown = this.shown.map((x, i) => (i === side ? slot : x));
+    store.set('shown:' + this.id, this.shown);
+    this.applyLayout();
+    const p = this.panes[slot]; p.setFocus(); if (p.term) p.term.focus();
   }
   show(on) {
     this.el.hidden = !on;
@@ -442,7 +510,7 @@ class Deck {
 function setLayout(l) {
   S.layout = l; store.set('layout', l);
   document.querySelectorAll('#layoutSeg button').forEach((b) => b.classList.toggle('on', b.dataset.layout === l));
-  S.decks.forEach((d) => { d.el.dataset.layout = l; d.panes.forEach((p) => p.scheduleFit()); });
+  S.decks.forEach((d) => { d.el.dataset.layout = l; d.applyLayout(); });
 }
 document.querySelectorAll('#layoutSeg button').forEach((b) => b.addEventListener('click', () => setLayout(b.dataset.layout)));
 
@@ -472,7 +540,10 @@ function notifyDone(p, slot, st) {
   if (s.attention && s.attention.voice) voiceAgentDone(p, slot, st, s.attention.message);
   if (p.id !== S.current) { S.done.add(p.id); store.set('done', [...S.done]); }
   if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-    new Notification(`${p.name} · agent ${slot + 1}`, { body: st === 'perm' ? 'Demande ton autorisation' : 'A terminé, en attente de toi', tag: p.id + slot });
+    const q = st === 'ask' && s.attention.message ? s.attention.message.replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+    // renotify : sans ça, une notification qui remplace la précédente du même agent (même tag) arrive en silence sur Mac
+    const n = new Notification(`${p.name} · agent ${slot + 1}`, { body: st === 'perm' ? 'Demande ton autorisation' : st === 'ask' ? `Te pose une question${q ? ' : ' + q : ''}` : 'A terminé, en attente de toi', tag: p.id + slot, renotify: true, requireInteraction: st === 'ask' });
+    n.onclick = () => { window.focus(); selectProject(p.id); n.close(); };
   }
 }
 
@@ -802,12 +873,12 @@ function voiceAgentDone(p, slot, st, message) {
   const who = `${p.name} · agent ${slot + 1}`;
   const full = message ? message.replace(/\s+/g, ' ').trim() : '';
   voiceOpen();
-  voiceLog(who, st === 'perm' ? 'demande ton autorisation' : (full || 'a terminé'), 'agent', { id: p.id, slot });
+  voiceLog(who, st === 'perm' ? 'demande ton autorisation' : st === 'ask' ? `te pose une question${full ? ' : ' + full : ''}` : (full || 'a terminé'), 'agent', { id: p.id, slot });
   // À l'oreille : la cible et les deux premières phrases, sans dépasser ~220 caractères (le détail est dans le fil)
   const sentences = full.replace(/[`*_#>]+/g, '').replace(/^[-•]\s*/gm, '').split(/(?<=[.!?])\s+/).filter(Boolean);
   let brief = sentences.slice(0, 2).join(' ');
   if (brief.length > 220) brief = brief.slice(0, 217).replace(/\s+\S*$/, '') + '…';
-  speak(st === 'perm' ? `${p.name}, agent ${slot + 1} demande ton autorisation.` : `${p.name}, agent ${slot + 1} a terminé.${brief ? ' ' + brief : ''}`);
+  speak(st === 'perm' ? `${p.name}, agent ${slot + 1} demande ton autorisation.` : st === 'ask' ? `${p.name}, agent ${slot + 1} te pose une question.${brief ? ' ' + brief : ''}` : `${p.name}, agent ${slot + 1} a terminé.${brief ? ' ' + brief : ''}`);
 }
 $('#micBtn').addEventListener('click', voiceStart);
 $('#voiceClose').addEventListener('click', voiceClose);
@@ -943,6 +1014,8 @@ $('#refreshTree').addEventListener('click', () => refreshTree(FS(), true));
 
 // ---------------------------------------------------------------- upload de fichiers dans le projet
 const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+const SLOT_DND = 'application/x-agentdeck-slot';
+const hasSlot = (e) => e.dataTransfer && [...e.dataTransfer.types].includes(SLOT_DND);
 const fmtSize = (n) => n < 1024 ? n + ' o' : n < 1048576 ? (n / 1024).toFixed(0) + ' Ko' : (n / 1048576).toFixed(1) + ' Mo';
 // Dossier cible : le dossier sélectionné dans l'arbre, ou le dossier du fichier sélectionné, sinon la racine
 function uploadDir(fs) {
@@ -1189,7 +1262,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.altKey && /^[1-4]$/.test(e.key)) {
     e.preventDefault();
     const d = S.decks.get(S.current); const p = d && d.panes[Number(e.key) - 1];
-    if (p) { p.setFocus(); if (p.term) p.term.focus(); }
+    if (p) { d.reveal(p.slot); p.setFocus(); if (p.term) p.term.focus(); }
   }
 }, true);
 

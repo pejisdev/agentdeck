@@ -28,7 +28,10 @@
       <div class="logo"><i></i><i></i><i></i><i></i></div>
       <div><b>Agent Deck</b><small id="hostName"></small></div>
     </header>
-    <input id="projFilter" class="filter" placeholder="Filtrer les projets…" spellcheck="false">
+    <div class="filter-wrap">
+      <input id="projFilter" class="filter" placeholder="Filtrer les projets…" spellcheck="false">
+      <button id="projFilterClear" title="Effacer (Échap)" hidden>×</button>
+    </div>
     <ul id="projList"></ul>
     <section id="usage" title="Comptes Claude et limites de leur plan (comme /usage dans Claude Code)">
       <div class="usage-head"><span>Comptes Claude</span>
@@ -52,6 +55,7 @@
       <span class="spacer"></span>
       <div class="seg" id="layoutSeg">
         <button data-layout="grid" title="Grille 2×2">▦</button>
+        <button data-layout="two" title="2 colonnes (les 2 autres agents restent accessibles en bas)">◫</button>
         <button data-layout="cols" title="4 colonnes">▥</button>
         <button data-layout="rows" title="4 lignes">☰</button>
       </div>
